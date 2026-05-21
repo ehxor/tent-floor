@@ -1,0 +1,260 @@
+{
+    "whisper": {
+        "bin": null,
+        "model": "large-v3",
+        "model_path": null
+    },
+
+    "groups": {
+        "vancouver-island": {
+            "outputs": {
+                "feed_url": "https://scanner-feed.ehxor.workers.dev",
+                "feed_token": ""
+            },
+
+            "streams": [
+                {
+                    "name": "Mid Island",
+                    "url": "https://icecast0.scanbc.com/nanaimo",
+                    "jargon": "jargon.txt",
+                    "tone_lookup": "tone_lookup_vancouver_island.json"
+                },
+                {
+                    "name": "Cowichan Valley",
+                    "url": "https://broadcastify.cdnstream1.com/44935",
+                    "jargon": "jargon.txt",
+                    "tone_lookup": "tone_lookup_vancouver_island.json"
+                },
+                {
+                    "name": "Comox Valley",
+                    "url": "https://broadcastify.cdnstream1.com/31760",
+                    "jargon": "jargon.txt",
+                    "tone_lookup": "tone_lookup_vancouver_island.json"
+                },
+                {
+                    "name": "North Island",
+                    "url": "https://broadcastify.cdnstream1.com/21518",
+                    "jargon": "jargon.txt",
+                    "tone_lookup": "tone_lookup_vancouver_island.json"
+                }
+            ],
+
+            "pollers": [
+                {
+                    "type": "pulsepoint",
+                    "agency": "EMS1201",
+                    "unit_prefix": ["1"]
+                },
+                {
+                    "type": "nanaimo_fire"
+                },
+                {
+                    "type": "bc_wildfire",
+                    "fire_centre_code": "50",
+                    "polygon": [
+                      [
+                        -123.1937696,
+                        48.9767932
+                      ],
+                      [
+                        -124.0304776,
+                        49.4728465
+                      ],
+                      [
+                        -124.3382323,
+                        49.7336576
+                      ],
+                      [
+                        -124.5598943,
+                        49.7944415
+                      ],
+                      [
+                        -124.6148505,
+                        49.8732889
+                      ],
+                      [
+                        -124.7962059,
+                        49.9740966
+                      ],
+                      [
+                        -124.882075,
+                        50.0351565
+                      ],
+                      [
+                        -124.8188753,
+                        50.0827735
+                      ],
+                      [
+                        -124.7501801,
+                        50.1400275
+                      ],
+                      [
+                        -124.6622502,
+                        50.1646697
+                      ],
+                      [
+                        -124.6347721,
+                        50.2446691
+                      ],
+                      [
+                        -124.6861791,
+                        50.3012176
+                      ],
+                      [
+                        -124.7176065,
+                        50.3128298
+                      ],
+                      [
+                        -124.7450846,
+                        50.3115141
+                      ],
+                      [
+                        -124.7897365,
+                        50.2996712
+                      ],
+                      [
+                        -124.9298748,
+                        50.3163382
+                      ],
+                      [
+                        -124.9820832,
+                        50.3391362
+                      ],
+                      [
+                        -125.0521523,
+                        50.3088826
+                      ],
+                      [
+                        -125.1064216,
+                        50.3347528
+                      ],
+                      [
+                        -125.1485643,
+                        50.3675475
+                      ],
+                      [
+                        -125.1502817,
+                        50.3911966
+                      ],
+                      [
+                        -125.1811945,
+                        50.4003903
+                      ],
+                      [
+                        -125.2790853,
+                        50.4458947
+                      ],
+                      [
+                        -125.6408661,
+                        50.4355048
+                      ],
+                      [
+                        -126.0573882,
+                        50.462654
+                      ],
+                      [
+                        -126.5372245,
+                        50.5046044
+                      ],
+                      [
+                        -126.8154878,
+                        50.6975889
+                      ],
+                      [
+                        -127.880951,
+                        51.030481
+                      ],
+                      [
+                        -129.1625751,
+                        50.9067911
+                      ],
+                      [
+                        -129.1818098,
+                        50.6026626
+                      ],
+                      [
+                        -127.6156456,
+                        49.9081273
+                      ],
+                      [
+                        -126.1757934,
+                        49.0442559
+                      ],
+                      [
+                        -125.0107221,
+                        48.5666205
+                      ],
+                      [
+                        -124.0663329,
+                        48.3783833
+                      ],
+                      [
+                        -123.5415012,
+                        48.2523301
+                      ],
+                      [
+                        -123.2625865,
+                        48.3880732
+                      ],
+                      [
+                        -123.1815261,
+                        48.4673664
+                      ],
+                      [
+                        -123.2280181,
+                        48.6242394
+                      ],
+                      [
+                        -123.2486266,
+                        48.7045234
+                      ],
+                      [
+                        -123.1359664,
+                        48.734427
+                      ],
+                      [
+                        -123.0017818,
+                        48.7805691
+                      ],
+                      [
+                        -123.1937696,
+                        48.9767932
+                      ]
+                    ]
+                }
+            ]
+        },
+
+        "interior": {
+            "outputs": {
+                "feed_url": "https://scanner-feed-interior.ehxor.workers.dev",
+                "feed_token": ""
+            },
+            "streams": [
+                {
+                    "name": "Kamloops",
+                    "url": "https://icecast0.scanbc.com/kamloops",
+                    "jargon": "jargon.txt",
+                    "tone_lookup": "tone_lookup_interior.json"
+                },
+                {
+                    "name": "North OK",
+                                "url": "https://icecast0.scanbc.com/northok",
+                                "jargon": "jargon.txt",
+                                "tone_lookup": "tone_lookup_interior.json"
+                }
+            ],
+            "pollers": [
+                {
+                    "type": "pulsepoint",
+                    "agency": "EMS1201",
+                    "unit_prefix": ["3"]
+                },
+                {
+                    "type": "bc_wildfire",
+                    "fire_centre_code": "25"
+                }
+            ]
+        }
+    }
+}

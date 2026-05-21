@@ -1,0 +1,22 @@
+[
+    {
+        "name": "Mid Island",
+        "url": "https://icecast0.scanbc.com/nanaimo",
+        "jargon": "jargon.txt"
+    },
+    {
+        "name": "Cowichan Valley",
+        "url": "https://broadcastify.cdnstream1.com/44935",
+        "jargon": "jargon.txt"
+    },
+    {
+        "name": "Comox Valley",
+        "url": "https://broadcastify.cdnstream1.com/31760",
+        "jargon": "jargon.txt"
+    },
+    {
+        "name": "North Island",
+        "url": "https://broadcastify.cdnstream1.com/21518",
+        "jargon": "jargon.txt"
+    }
+]

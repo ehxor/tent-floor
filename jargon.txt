@@ -1,0 +1,70 @@
+# Place names
+Nanaimo
+Parksville
+Qualicum
+Ladysmith
+Duncan
+Cowichan
+Lantzville
+Gabriola
+Cedar
+Campbell River
+Cassidy
+Departure Bay
+Honeymoon Bay
+Harewood
+Courtney
+
+# Units / call signs
+Nanaimo Rescue 1
+Nanaimo Engine 1
+Nanaimo Engine 3
+Nanaimo Ladder 1
+Nanaimo Battalion Chief
+
+Two Two
+Twenty
+Seven-Three
+Three Eight Alpha
+Two two alpha one
+Five-two-alpha-two
+Five-one-alpha-one
+
+# Common dispatch terms
+Command
+Engine
+Tender
+Paging
+Page
+Routine
+Enroute
+Responding
+Roger
+CAD
+MVI
+Code 3
+Structure fire
+Working fire
+BCAS
+EHS
+BCEHS
+RCMP
+First responder
+Mutual aid
+Staging
+Alpha
+Bravo
+Charlie
+Delta
+Echo
+Sierra
+Sixes
+Fives
+Refusal
+Emerge
+MESA
+
+Yellow
+Orange
+Red
+Purple

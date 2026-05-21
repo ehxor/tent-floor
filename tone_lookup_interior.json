@@ -1,0 +1,15 @@
+{
+  "_comment": "Two-tone pager lookup table — Interior region. Keys are 'toneA_freq/toneB_freq'.",
+  "433.7/368.5": "🚒 Kamloops Engine 2",
+  "433.7/389.0": "🚒 Kamloops Engine 3",
+  "433.7/483.5": "🚒 Kamloops Engine 7",
+  "669.3/600.9": "🚒 Chase Fire Department",
+  "634.1/669.3": "🚑 173-Alpha",
+  "669.3/706.4": "🚑 130-Alpha-2",
+  "1146.5/1277.5": "🚑 149-Kilo",
+  "1146.5/1348.5": "🚑 153-Alpha",
+  "1210.0/1146.5": "🚑 122-Delta",
+  "1210.0/1277.5": "🚑 120-Alpha-3",
+  "1210.0/1348.5": "🚑 119-Kilo",
+  "1210.0/1423.4": "🚑 122-Bravo"
+}
