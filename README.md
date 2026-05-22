@@ -50,6 +50,9 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 ```bash
 cd web/scanner-feed
+npx wrangler kv namespace create SCANNER_KV
+# Add the created ID to web/scanner-feed/wrangler.toml
+# Then deploy with:
 npx wrangler deploy
 npx wrangler secret put INGEST_TOKEN  # Set your auth token
 ```
