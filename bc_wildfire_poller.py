@@ -26,15 +26,26 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-BC_WILDFIRE_API = (
+BC_WILDFIRE_API_BASE = (
     "https://wildfiresituation.nrs.gov.bc.ca/wfnews-api/publicPublishedIncident"
     "?pageNumber=1&pageRowCount=100"
-    "&stageOfControlList=OUT_CNTRL"
+    "&orderBy=lastUpdatedTimestamp%20DESC"
+)
+BC_WILDFIRE_NEW_FIRES = (
+    BC_WILDFIRE_API_BASE
+    + "&stageOfControlList=OUT_CNTRL"
     "&stageOfControlList=HOLDING"
     "&stageOfControlList=UNDR_CNTRL"
     "&stageOfControlList=NEW"
     "&newFires=true"
-    "&orderBy=lastUpdatedTimestamp%20DESC"
+)
+BC_WILDFIRE_FIRES_OF_NOTE = (
+    BC_WILDFIRE_API_BASE
+    + "&stageOfControlList=OUT_CNTRL"
+    "&stageOfControlList=HOLDING"
+    "&stageOfControlList=UNDR_CNTRL"
+    "&stageOfControlList=NEW"
+    "&fireOfNoteInd=true"
 )
 POLL_INTERVAL_S = 600  # 10 minutes
 
@@ -144,12 +155,8 @@ def nearest_town(lat, lon):
 # ---------------------------------------------------------------------------
 # API fetch
 # ---------------------------------------------------------------------------
-def fetch_incidents(fire_centre_code=None):
-    """Fetch current wildfire incidents from BC Wildfire Service API."""
-    url = BC_WILDFIRE_API
-    if fire_centre_code:
-        url += f"&fireCentreCode={fire_centre_code}"
-
+def _fetch_url(url):
+    """Fetch a single API URL and return the collection list, or None on error."""
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0",
     })
@@ -160,6 +167,34 @@ def fetch_incidents(fire_centre_code=None):
     except Exception as e:
         print(f"[bc-wildfire] Error fetching data: {e}", file=sys.stderr)
         return None
+
+
+def fetch_incidents(fire_centre_code=None):
+    """Fetch current wildfire incidents from BC Wildfire Service API.
+
+    Makes two queries -- one for new fires and one for fires of note --
+    and merges the results so we track both.
+    """
+    suffix = f"&fireCentreCode={fire_centre_code}" if fire_centre_code else ""
+
+    new_fires = _fetch_url(BC_WILDFIRE_NEW_FIRES + suffix)
+    fon_fires = _fetch_url(BC_WILDFIRE_FIRES_OF_NOTE + suffix)
+
+    if new_fires is None and fon_fires is None:
+        return None
+
+    # Merge by guid, fires-of-note take precedence (more up-to-date fields)
+    merged = {}
+    for incident in (new_fires or []):
+        guid = incident.get("incidentGuid")
+        if guid:
+            merged[guid] = incident
+    for incident in (fon_fires or []):
+        guid = incident.get("incidentGuid")
+        if guid:
+            merged[guid] = incident
+
+    return list(merged.values())
 
 
 # ---------------------------------------------------------------------------
