@@ -15,6 +15,8 @@ Requirements:
 """
 
 import json
+import math
+import os
 import sys
 import time
 import threading
@@ -89,6 +91,54 @@ def parse_polygon(polygon):
         lon, lat = pair.split(",")
         points.append((float(lat), float(lon)))
     return points
+
+
+# ---------------------------------------------------------------------------
+# Nearest-town lookup
+# ---------------------------------------------------------------------------
+_TOWNS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bc_towns.txt")
+
+
+def _load_towns(path=_TOWNS_FILE):
+    """Load towns from TSV file. Returns list of (name, lat, lon)."""
+    towns = []
+    with open(path, encoding="utf-8") as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 3:
+                name, lat, lon = parts[0], float(parts[1]), float(parts[2])
+                towns.append((name, lat, lon))
+    return towns
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two points in km."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# Pre-load towns at import time
+_TOWNS = _load_towns()
+
+
+def nearest_town(lat, lon):
+    """Return (name, distance_km) of the nearest town to the given point."""
+    best_name = None
+    best_dist = float("inf")
+    for name, tlat, tlon in _TOWNS:
+        d = _haversine_km(lat, lon, tlat, tlon)
+        if d < best_dist:
+            best_dist = d
+            best_name = name
+    if best_name is None:
+        return None, None
+    return best_name, round(best_dist, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +221,13 @@ class BCWildfireTracker:
             fire_of_note = incident.get("fireOfNoteInd", False)
             fire_centre = incident.get("fireCentreName", "")
 
+            fire_lat = incident.get("latitude")
+            fire_lon = incident.get("longitude")
+            try:
+                town_name, town_dist = nearest_town(float(fire_lat), float(fire_lon))
+            except (TypeError, ValueError):
+                town_name, town_dist = None, None
+
             if guid not in self.known_incidents:
                 # Distinguish newly declared fires from fires we're
                 # seeing for the first time that already have a status.
@@ -185,8 +242,10 @@ class BCWildfireTracker:
                     "size_ha": size_ha,
                     "fire_of_note": fire_of_note,
                     "fire_centre": fire_centre,
-                    "latitude": incident.get("latitude"),
-                    "longitude": incident.get("longitude"),
+                    "latitude": fire_lat,
+                    "longitude": fire_lon,
+                    "nearest_town": town_name,
+                    "nearest_town_km": town_dist,
                 })
                 self.known_incidents[guid] = snapshot
                 continue
@@ -213,6 +272,8 @@ class BCWildfireTracker:
                     "fire_of_note": fire_of_note,
                     "fire_centre": fire_centre,
                     "changes": changes,
+                    "nearest_town": town_name,
+                    "nearest_town_km": town_dist,
                 })
                 self.known_incidents[guid] = snapshot
 
@@ -258,20 +319,30 @@ def _format_changes(changes):
     return ", ".join(parts)
 
 
+def _format_nearby(event):
+    """Format nearest-town suffix, e.g. ', 4.2 km from Kamloops'."""
+    town = event.get("nearest_town")
+    dist = event.get("nearest_town_km")
+    if town and dist is not None:
+        return f", {dist} km from {town}"
+    return ""
+
+
 def format_event(event):
     """Format for terminal output."""
     t = event["type"]
+    nearby = _format_nearby(event)
     if t == "wildfire_declared":
         fon = " [FIRE OF NOTE]" if event.get("fire_of_note") else ""
         return (f"🚨🔥 NEW BC WILDFIRE DECLARED: {event['name']} ({event['label']}) -- "
-                f"{_format_size(event['size_ha'])}, {event['fire_centre']}{fon}")
+                f"{_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}")
     elif t == "wildfire_new":
         fon = " [FIRE OF NOTE]" if event.get("fire_of_note") else ""
         return (f"🌲🔥 BC WILDFIRE: {event['name']} ({event['label']}) -- "
-                f"{event['stage']}, {_format_size(event['size_ha'])}{fon}")
+                f"{event['stage']}, {_format_size(event['size_ha'])}{nearby}{fon}")
     elif t == "wildfire_update":
         return (f"🌲🔥 BC WILDFIRE UPDATE: {event['name']} ({event['label']}) -- "
-                f"{_format_changes(event['changes'])}")
+                f"{_format_changes(event['changes'])}{nearby}")
     elif t == "wildfire_removed":
         return f"🌲 BC WILDFIRE REMOVED: {event['name']} -- no longer in feed"
     return str(event)
@@ -292,17 +363,18 @@ def format_event_discord(event):
     t = event["type"]
     url = _incident_url(event)
     link = f"\n<{url}>" if url else ""
+    nearby = _format_nearby(event)
     if t == "wildfire_declared":
         fon = " **[FIRE OF NOTE]**" if event.get("fire_of_note") else ""
         return (f"🚨🔥 **NEW BC WILDFIRE DECLARED: {event['name']}** ({event['label']}) -- "
-                f"{_format_size(event['size_ha'])}, {event['fire_centre']}{fon}{link}")
+                f"{_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}{link}")
     elif t == "wildfire_new":
         fon = " **[FIRE OF NOTE]**" if event.get("fire_of_note") else ""
         return (f"🌲🔥 **BC WILDFIRE: {event['name']}** ({event['label']}) -- "
-                f"{event['stage']}, {_format_size(event['size_ha'])}{fon}{link}")
+                f"{event['stage']}, {_format_size(event['size_ha'])}{nearby}{fon}{link}")
     elif t == "wildfire_update":
         return (f"🌲🔥 **BC WILDFIRE UPDATE: {event['name']}** ({event['label']}) -- "
-                f"{_format_changes(event['changes'])}{link}")
+                f"{_format_changes(event['changes'])}{nearby}{link}")
     elif t == "wildfire_removed":
         return f"🌲 **BC WILDFIRE REMOVED: {event['name']}** -- no longer in feed"
     return str(event)
