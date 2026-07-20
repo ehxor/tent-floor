@@ -31,13 +31,12 @@ BC_WILDFIRE_API_BASE = (
     "?pageNumber=1&pageRowCount=100"
     "&orderBy=lastUpdatedTimestamp%20DESC"
 )
-BC_WILDFIRE_NEW_FIRES = (
+BC_WILDFIRE_ACTIVE_FIRES = (
     BC_WILDFIRE_API_BASE
     + "&stageOfControlList=OUT_CNTRL"
     "&stageOfControlList=HOLDING"
     "&stageOfControlList=UNDR_CNTRL"
     "&stageOfControlList=NEW"
-    "&newFires=true"
 )
 BC_WILDFIRE_FIRES_OF_NOTE = (
     BC_WILDFIRE_API_BASE
@@ -177,7 +176,7 @@ def fetch_incidents(fire_centre_code=None):
     """
     suffix = f"&fireCentreCode={fire_centre_code}" if fire_centre_code else ""
 
-    new_fires = _fetch_url(BC_WILDFIRE_NEW_FIRES + suffix)
+    new_fires = _fetch_url(BC_WILDFIRE_ACTIVE_FIRES + suffix)
     fon_fires = _fetch_url(BC_WILDFIRE_FIRES_OF_NOTE + suffix)
 
     if new_fires is None and fon_fires is None:
@@ -264,11 +263,8 @@ class BCWildfireTracker:
                 town_name, town_dist = None, None
 
             if guid not in self.known_incidents:
-                # Distinguish newly declared fires from fires we're
-                # seeing for the first time that already have a status.
-                is_new_fire = incident.get("stageOfControlCode") == "NEW"
                 events.append({
-                    "type": "wildfire_declared" if is_new_fire else "wildfire_new",
+                    "type": "wildfire_declared",
                     "guid": guid,
                     "name": name,
                     "label": label,
@@ -370,11 +366,7 @@ def format_event(event):
     if t == "wildfire_declared":
         fon = " [FIRE OF NOTE]" if event.get("fire_of_note") else ""
         return (f"🚨🔥 NEW BC WILDFIRE DECLARED: {event['name']} ({event['label']}) -- "
-                f"{_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}")
-    elif t == "wildfire_new":
-        fon = " [FIRE OF NOTE]" if event.get("fire_of_note") else ""
-        return (f"🌲🔥 BC WILDFIRE: {event['name']} ({event['label']}) -- "
-                f"{event['stage']}, {_format_size(event['size_ha'])}{nearby}{fon}")
+                f"{event['stage']}, {_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}")
     elif t == "wildfire_update":
         return (f"🌲🔥 BC WILDFIRE UPDATE: {event['name']} ({event['label']}) -- "
                 f"{_format_changes(event['changes'])}{nearby}")
@@ -402,11 +394,7 @@ def format_event_discord(event):
     if t == "wildfire_declared":
         fon = " **[FIRE OF NOTE]**" if event.get("fire_of_note") else ""
         return (f"🚨🔥 **NEW BC WILDFIRE DECLARED: {event['name']}** ({event['label']}) -- "
-                f"{_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}{link}")
-    elif t == "wildfire_new":
-        fon = " **[FIRE OF NOTE]**" if event.get("fire_of_note") else ""
-        return (f"🌲🔥 **BC WILDFIRE: {event['name']}** ({event['label']}) -- "
-                f"{event['stage']}, {_format_size(event['size_ha'])}{nearby}{fon}{link}")
+                f"{event['stage']}, {_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}{link}")
     elif t == "wildfire_update":
         return (f"🌲🔥 **BC WILDFIRE UPDATE: {event['name']}** ({event['label']}) -- "
                 f"{_format_changes(event['changes'])}{nearby}{link}")
