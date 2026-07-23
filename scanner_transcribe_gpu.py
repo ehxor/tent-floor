@@ -713,7 +713,9 @@ def main():
                         def cb(event):
                             ts = datetime.now().strftime("%H:%M:%S")
                             print(f"[{ts}] [{gn}] {wf_fmt(event)}")
-                            o.send_all(wf_fmt(event), wf_fmt_d(event), line_type="bc_wildfire")
+                            if event["type"] != "wildfire_removed":
+                                o.send_all(wf_fmt(event), wf_fmt_d(event), line_type="bc_wildfire")
+
                         return cb
 
                     wf = BCWildfirePoller(polygon=polygon,
