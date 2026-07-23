@@ -34,6 +34,7 @@ import struct
 import os
 import select
 import urllib.request
+import urllib.parse
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -106,18 +107,63 @@ def send_to_feed(message, feed_url, feed_token, line_type="transcript"):
         pass
 
 
+def send_to_mastodon(message, instance_url, access_token, visibility="public",
+                      in_reply_to_id=None):
+    """Post a status to Mastodon. Returns the new status id (str), or None on failure."""
+    if not instance_url or not access_token:
+        return None
+    params = {"status": message, "visibility": visibility}
+    if in_reply_to_id:
+        params["in_reply_to_id"] = in_reply_to_id
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    url = instance_url.rstrip("/") + "/api/v1/statuses"
+    req = urllib.request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "ScannerFeed/1.0",
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        result = json.loads(resp.read().decode())
+        return result.get("id")
+    except Exception as e:
+        print(f"[mastodon] Error posting status: {e}", file=sys.stderr)
+        return None
+
+
 class GroupOutputs:
     """Holds output destinations for a group."""
-    def __init__(self, discord_webhook=None, feed_url=None, feed_token=None):
+    def __init__(self, discord_webhook=None, feed_url=None, feed_token=None,
+                 mastodon_instance_url=None, mastodon_access_token=None,
+                 mastodon_visibility="public"):
         self.discord_webhook = discord_webhook
         self.feed_url = feed_url
         self.feed_token = feed_token or ""
+        self.mastodon_instance_url = mastodon_instance_url
+        self.mastodon_access_token = mastodon_access_token
+        self.mastodon_visibility = mastodon_visibility or "public"
+        self._mastodon_threads = {}  # thread_key -> status id of the root post
 
     def send_discord(self, message):
         send_to_discord(message, self.discord_webhook)
 
     def send_feed(self, message, line_type="transcript"):
         send_to_feed(message, self.feed_url, self.feed_token, line_type)
+
+    def send_mastodon(self, message, thread_key=None):
+        """Post a status to Mastodon.
+
+        If thread_key is given and we've already posted a status for that
+        key, reply to it so updates about the same incident thread together.
+        """
+        if not self.mastodon_instance_url or not self.mastodon_access_token:
+            return
+        in_reply_to = self._mastodon_threads.get(thread_key) if thread_key else None
+        status_id = send_to_mastodon(
+            message, self.mastodon_instance_url, self.mastodon_access_token,
+            visibility=self.mastodon_visibility, in_reply_to_id=in_reply_to)
+        if status_id and thread_key:
+            self._mastodon_threads[thread_key] = status_id
 
     def send_all(self, plain_msg, discord_msg, line_type="transcript"):
         """Send to both outputs. plain_msg for feed, discord_msg for Discord."""
@@ -472,10 +518,14 @@ def load_config(config_path):
     for group_name, group_def in raw.get("groups", {}).items():
         # Outputs
         out_cfg = group_def.get("outputs", {})
+        mastodon_cfg = out_cfg.get("mastodon") or {}
         outputs = GroupOutputs(
             discord_webhook=out_cfg.get("discord_webhook"),
             feed_url=out_cfg.get("feed_url"),
             feed_token=out_cfg.get("feed_token"),
+            mastodon_instance_url=mastodon_cfg.get("instance_url"),
+            mastodon_access_token=mastodon_cfg.get("access_token"),
+            mastodon_visibility=mastodon_cfg.get("visibility", "public"),
         )
 
         # Streams
@@ -613,6 +663,8 @@ def main():
             print(f"[init]   Discord: configured")
         if out.feed_url:
             print(f"[init]   Web feed: {out.feed_url}")
+        if out.mastodon_instance_url:
+            print(f"[init]   Mastodon: {out.mastodon_instance_url}")
         for s in g["streams"]:
             color = s["color"] if not args.no_color else ""
             reset = COLOR_RESET if not args.no_color else ""
@@ -703,7 +755,8 @@ def main():
             elif ptype == "bc_wildfire":
                 try:
                     from bc_wildfire_poller import BCWildfirePoller, parse_polygon, \
-                        format_event as wf_fmt, format_event_discord as wf_fmt_d
+                        format_event as wf_fmt, format_event_discord as wf_fmt_d, \
+                        format_event_mastodon as wf_fmt_m
 
                     polygon_cfg = poller_cfg.get("polygon")
                     polygon = parse_polygon(polygon_cfg) if polygon_cfg else None
@@ -715,6 +768,8 @@ def main():
                             print(f"[{ts}] [{gn}] {wf_fmt(event)}")
                             if event["type"] != "wildfire_removed":
                                 o.send_all(wf_fmt(event), wf_fmt_d(event), line_type="bc_wildfire")
+                                # Reply within the same fire's thread, keyed by incident guid
+                                o.send_mastodon(wf_fmt_m(event), thread_key=event["guid"])
 
                         return cb
 

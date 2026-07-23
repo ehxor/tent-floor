@@ -403,6 +403,27 @@ def format_event_discord(event):
     return str(event)
 
 
+def format_event_mastodon(event):
+    """Format for Mastodon (plain text; links are auto-linked without markdown)."""
+    t = event["type"]
+    url = _incident_url(event)
+    nearby = _format_nearby(event)
+    if t == "wildfire_declared":
+        fon = " [FIRE OF NOTE]" if event.get("fire_of_note") else ""
+        text = (f"🚨🔥 NEW BC WILDFIRE DECLARED: {event['name']} ({event['label']}) -- "
+                f"{event['stage']}, {_format_size(event['size_ha'])}, {event['fire_centre']}{nearby}{fon}")
+    elif t == "wildfire_update":
+        text = (f"🌲🔥 BC WILDFIRE UPDATE: {event['name']} ({event['label']}) -- "
+                f"{_format_changes(event['changes'])}{nearby}")
+    elif t == "wildfire_removed":
+        text = f"🌲 BC WILDFIRE REMOVED: {event['name']} -- no longer in feed"
+    else:
+        text = str(event)
+    if url:
+        text += f"\n{url}"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Background poller thread
 # ---------------------------------------------------------------------------
