@@ -135,14 +135,41 @@ class GroupOutputs:
     """Holds output destinations for a group."""
     def __init__(self, discord_webhook=None, feed_url=None, feed_token=None,
                  mastodon_instance_url=None, mastodon_access_token=None,
-                 mastodon_visibility="public"):
+                 mastodon_visibility="public", mastodon_state_file=None):
         self.discord_webhook = discord_webhook
         self.feed_url = feed_url
         self.feed_token = feed_token or ""
         self.mastodon_instance_url = mastodon_instance_url
         self.mastodon_access_token = mastodon_access_token
         self.mastodon_visibility = mastodon_visibility or "public"
-        self._mastodon_threads = {}  # thread_key -> status id of the root post
+        self.mastodon_state_file = mastodon_state_file
+        # thread_key -> status id of the root post, persisted across restarts
+        self._mastodon_threads = self._load_mastodon_state()
+
+    def _load_mastodon_state(self):
+        if not self.mastodon_state_file:
+            return {}
+        try:
+            with open(self.mastodon_state_file, encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[mastodon] Error loading thread state from "
+                  f"{self.mastodon_state_file}: {e}", file=sys.stderr)
+            return {}
+
+    def _save_mastodon_state(self):
+        if not self.mastodon_state_file:
+            return
+        tmp_path = f"{self.mastodon_state_file}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._mastodon_threads, f)
+            os.replace(tmp_path, self.mastodon_state_file)
+        except OSError as e:
+            print(f"[mastodon] Error saving thread state to "
+                  f"{self.mastodon_state_file}: {e}", file=sys.stderr)
 
     def send_discord(self, message):
         send_to_discord(message, self.discord_webhook)
@@ -154,7 +181,8 @@ class GroupOutputs:
         """Post a status to Mastodon.
 
         If thread_key is given and we've already posted a status for that
-        key, reply to it so updates about the same incident thread together.
+        key (including in a previous run, if a state file is configured),
+        reply to it so updates about the same incident thread together.
         """
         if not self.mastodon_instance_url or not self.mastodon_access_token:
             return
@@ -164,6 +192,7 @@ class GroupOutputs:
             visibility=self.mastodon_visibility, in_reply_to_id=in_reply_to)
         if status_id and thread_key:
             self._mastodon_threads[thread_key] = status_id
+            self._save_mastodon_state()
 
     def send_all(self, plain_msg, discord_msg, line_type="transcript"):
         """Send to both outputs. plain_msg for feed, discord_msg for Discord."""
@@ -519,6 +548,10 @@ def load_config(config_path):
         # Outputs
         out_cfg = group_def.get("outputs", {})
         mastodon_cfg = out_cfg.get("mastodon") or {}
+        mastodon_state_file = mastodon_cfg.get("state_file")
+        if mastodon_cfg and not mastodon_state_file:
+            safe_name = group_name.lower().replace(" ", "_")
+            mastodon_state_file = f"mastodon_threads_{safe_name}.json"
         outputs = GroupOutputs(
             discord_webhook=out_cfg.get("discord_webhook"),
             feed_url=out_cfg.get("feed_url"),
@@ -526,6 +559,7 @@ def load_config(config_path):
             mastodon_instance_url=mastodon_cfg.get("instance_url"),
             mastodon_access_token=mastodon_cfg.get("access_token"),
             mastodon_visibility=mastodon_cfg.get("visibility", "public"),
+            mastodon_state_file=mastodon_state_file,
         )
 
         # Streams
@@ -664,7 +698,8 @@ def main():
         if out.feed_url:
             print(f"[init]   Web feed: {out.feed_url}")
         if out.mastodon_instance_url:
-            print(f"[init]   Mastodon: {out.mastodon_instance_url}")
+            print(f"[init]   Mastodon: {out.mastodon_instance_url} "
+                  f"(thread state: {out.mastodon_state_file})")
         for s in g["streams"]:
             color = s["color"] if not args.no_color else ""
             reset = COLOR_RESET if not args.no_color else ""

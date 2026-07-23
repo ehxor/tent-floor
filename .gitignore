@@ -1,2 +1,3 @@
 whisper.cpp/
 __pycache__/
+mastodon_threads_*.json

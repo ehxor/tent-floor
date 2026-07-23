@@ -117,6 +117,7 @@ Create a `config.json` (see `config.json` in this repo for an example):
 | `outputs.mastodon.instance_url` | Optional Mastodon instance base URL (e.g. `https://mastodon.social`) |
 | `outputs.mastodon.access_token` | Access token for a Mastodon app with `write:statuses` scope |
 | `outputs.mastodon.visibility` | Post visibility: `public`, `unlisted`, `private`, or `direct` (default: `public`) |
+| `outputs.mastodon.state_file` | Path to a JSON file used to persist fire-thread state (default: `mastodon_threads_<group>.json` in the working directory) |
 | `streams[].jargon` | File with local terms for transcription context |
 | `streams[].tone_lookup` | Path to tone lookup JSON for this stream (optional) |
 | `pollers[].type` | `pulsepoint`, `nanaimo_fire`, or `bc_wildfire` |
@@ -132,7 +133,7 @@ Polls the BC Wildfire Service API every 10 minutes for active wildfires, filtere
 
 If `polygon` is set, only fires whose coordinates fall inside it are tracked. Use `--dump` in standalone mode to test your polygon against live data.
 
-If the group's `outputs.mastodon` is configured, each wildfire event is also posted as a Mastodon status. Updates for the same fire (matched by incident GUID) are posted as replies to that fire's first status, so each fire gets its own thread. Threads are tracked in memory only and reset if the process restarts.
+If the group's `outputs.mastodon` is configured, each wildfire event is also posted as a Mastodon status. Updates for the same fire (matched by incident GUID) are posted as replies to that fire's first status, so each fire gets its own thread. The GUID-to-status-id mapping is persisted to `outputs.mastodon.state_file` after each post, so threads survive process restarts.
 
 ## Usage
 
