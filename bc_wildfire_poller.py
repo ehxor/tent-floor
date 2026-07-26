@@ -328,7 +328,7 @@ class BCWildfireTracker:
 def _format_size(ha):
     if ha is None:
         return "unknown size"
-    return f"{ha} ha"
+    return f"{ha:,} ha"
 
 
 def _format_changes(changes):
