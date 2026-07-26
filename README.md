@@ -12,6 +12,7 @@ Live transcription and monitoring of emergency radio scanner streams with two-to
 - **Multi-Stream Support**: Process multiple scanner streams simultaneously with group-based configuration
 - **Web Feed**: Cloudflare Workers-based live feed with auto-refresh UI
 - **Discord Integration**: Optional Discord webhook notifications
+- **Mastodon Integration**: Optional posting of BC Wildfire events to a Mastodon account, threaded per fire
 
 ## Requirements
 
@@ -71,7 +72,12 @@ Create a `config.json` (see `config.json` in this repo for an example):
       "outputs": {
         "feed_url": "https://your-feed.workers.dev",
         "feed_token": "your-ingest-token",
-        "discord_webhook": "https://discordapp.com/api/webhooks/..."
+        "discord_webhook": "https://discordapp.com/api/webhooks/...",
+        "mastodon": {
+          "instance_url": "https://mastodon.social",
+          "access_token": "your-mastodon-access-token",
+          "visibility": "public"
+        }
       },
       "streams": [
         {
@@ -108,6 +114,10 @@ Create a `config.json` (see `config.json` in this repo for an example):
 | `outputs.feed_url` | Cloudflare Worker URL for web feed |
 | `outputs.feed_token` | Bearer token for feed ingestion |
 | `outputs.discord_webhook` | Optional Discord webhook URL |
+| `outputs.mastodon.instance_url` | Optional Mastodon instance base URL (e.g. `https://mastodon.social`) |
+| `outputs.mastodon.access_token` | Access token for a Mastodon app with `write:statuses` scope |
+| `outputs.mastodon.visibility` | Post visibility: `public`, `unlisted`, `private`, or `direct` (default: `public`) |
+| `outputs.mastodon.state_file` | Path to a JSON file used to persist fire-thread state (default: `mastodon_threads_<group>.json` in the working directory) |
 | `streams[].jargon` | File with local terms for transcription context |
 | `streams[].tone_lookup` | Path to tone lookup JSON for this stream (optional) |
 | `pollers[].type` | `pulsepoint`, `nanaimo_fire`, or `bc_wildfire` |
@@ -122,6 +132,8 @@ Polls the BC Wildfire Service API every 10 minutes for active wildfires, filtere
 | `fire_centre_code` | No | Fire centre code to pre-filter the API query (e.g. `50` for Kamloops) |
 
 If `polygon` is set, only fires whose coordinates fall inside it are tracked. Use `--dump` in standalone mode to test your polygon against live data.
+
+If the group's `outputs.mastodon` is configured, each wildfire event is also posted as a Mastodon status. Updates for the same fire (matched by incident GUID) are posted as replies to that fire's first status, so each fire gets its own thread. The GUID-to-status-id mapping is persisted to `outputs.mastodon.state_file` after each post, so threads survive process restarts.
 
 ## Usage
 
