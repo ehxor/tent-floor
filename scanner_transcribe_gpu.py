@@ -275,10 +275,15 @@ def log_ffmpeg_stderr(stream_name, proc, prefix=""):
         pass
 
 
+FFMPEG_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
 def start_ffmpeg(stream_url):
     cmd = ["ffmpeg", "-loglevel", "warning",
            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
            "-reconnect_delay_max", "30",
+           "-user_agent", FFMPEG_USER_AGENT,
            "-i", stream_url, "-f", "s16le", "-acodec", "pcm_s16le",
            "-ar", str(SAMPLE_RATE), "-ac", "1", "-"]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
