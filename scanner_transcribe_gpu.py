@@ -8,7 +8,11 @@ Usage:
     python scanner_transcribe.py --config config.json
 
     # Quick single-stream mode (still works)
-    python scanner_transcribe.py https://broadcastify.cdnstream1.com/12345
+    python scanner_transcribe.py https://icecast0.scanbc.com/nanaimo
+
+Broadcastify premium "Static URL" streams
+(https://audio.broadcastify.com/<FEEDID>.mp3) additionally require
+BROADCASTIFY_USERNAME and BROADCASTIFY_PASSWORD in the environment.
 
 See config.example.json for the full config format with groups, pollers,
 and per-group outputs (Discord webhooks + web feed URLs).

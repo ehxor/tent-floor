@@ -135,8 +135,9 @@ Create a `config.json` (see `config.json` in this repo for an example):
 | `whisper.model` | Model name (default: `large-v3`) |
 | `groups` | Named groups of streams + outputs |
 | `outputs.feed_url` | Cloudflare Worker URL for web feed |
-| `outputs.feed_token` | Bearer token for feed ingestion |
-| `outputs.discord_webhook` | Optional Discord webhook URL |
+| `outputs.feed_token` | Bearer token for feed ingestion (use `${VAR}`, see [Secrets](#secrets)) |
+| `outputs.discord_webhook` | Optional Discord webhook URL (use `${VAR}` if kept secret) |
+| `streams[].url` | Stream URL; `audio.broadcastify.com` hosts get basic auth automatically |
 | `streams[].jargon` | File with local terms for transcription context |
 | `streams[].tone_lookup` | Path to tone lookup JSON for this stream (optional) |
 | `pollers[].type` | `pulsepoint`, `nanaimo_fire`, or `bc_wildfire` |
@@ -157,6 +158,7 @@ If `polygon` is set, only fires whose coordinates fall inside it are tracked. Us
 Run with config file (recommended):
 
 ```bash
+set -a; . ./.env; set +a          # load secrets (see Secrets above)
 python scanner_transcribe_gpu.py --config config.json
 ```
 
