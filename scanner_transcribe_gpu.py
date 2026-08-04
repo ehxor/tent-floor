@@ -33,10 +33,12 @@ import tempfile
 import struct
 import os
 import select
+import base64
 import urllib.request
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Config — tweak these to taste
@@ -278,14 +280,45 @@ def log_ffmpeg_stderr(stream_name, proc, prefix=""):
 FFMPEG_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
+# Broadcastify premium "Static URL" streams require HTTP basic auth using the
+# membership login. Credentials come from the environment so they never land in
+# config.json (which is tracked in git).
+BROADCASTIFY_AUTH_HOSTS = ("audio.broadcastify.com",)
+BROADCASTIFY_USER_ENV = "BROADCASTIFY_USERNAME"
+BROADCASTIFY_PASS_ENV = "BROADCASTIFY_PASSWORD"
+
+
+def url_needs_broadcastify_auth(stream_url):
+    try:
+        return (urlparse(stream_url).hostname or "").lower() in BROADCASTIFY_AUTH_HOSTS
+    except ValueError:
+        return False
+
+
+def broadcastify_auth_header():
+    """Build an Authorization header value, or None if credentials are unset."""
+    user = os.environ.get(BROADCASTIFY_USER_ENV)
+    password = os.environ.get(BROADCASTIFY_PASS_ENV)
+    if not user or not password:
+        return None
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Authorization: Basic {token}\r\n"
+
 
 def start_ffmpeg(stream_url):
     cmd = ["ffmpeg", "-loglevel", "warning",
            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_at_eof", "1",
            "-reconnect_delay_max", "30",
-           "-user_agent", FFMPEG_USER_AGENT,
-           "-i", stream_url, "-f", "s16le", "-acodec", "pcm_s16le",
-           "-ar", str(SAMPLE_RATE), "-ac", "1", "-"]
+           "-user_agent", FFMPEG_USER_AGENT]
+    # Sent as a header rather than as userinfo in the URL. Note that basic auth
+    # is only base64, so this keeps the plaintext password out of the process
+    # list but is not a real secret barrier against anyone who can read `ps`.
+    if url_needs_broadcastify_auth(stream_url):
+        header = broadcastify_auth_header()
+        if header:
+            cmd += ["-headers", header]
+    cmd += ["-i", stream_url, "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", str(SAMPLE_RATE), "-ac", "1", "-"]
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -457,8 +490,36 @@ def format_timestamp():
 # ===================================================================
 # Config loader
 # ===================================================================
+ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env_vars(value, missing):
+    """Recursively substitute ${VAR} references in config strings.
+
+    Unset variables expand to an empty string and are collected in `missing`
+    so the caller can warn about them.
+    """
+    if isinstance(value, str):
+        def replace(match):
+            name = match.group(1)
+            env_value = os.environ.get(name)
+            if env_value is None:
+                missing.add(name)
+                return ""
+            return env_value
+        return ENV_VAR_PATTERN.sub(replace, value)
+    if isinstance(value, dict):
+        return {k: expand_env_vars(v, missing) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env_vars(v, missing) for v in value]
+    return value
+
+
 def load_config(config_path):
     """Load and validate the JSON config file.
+
+    String values may reference environment variables as ${VAR}; secrets such
+    as feed tokens and webhook URLs should be kept out of the file this way.
 
     Returns a dict with:
         whisper: {bin, model, model_path}
@@ -467,6 +528,11 @@ def load_config(config_path):
     """
     with open(config_path) as f:
         raw = json.load(f)
+
+    missing = set()
+    raw = expand_env_vars(raw, missing)
+    for name in sorted(missing):
+        print(f"[config] Warning: ${{{name}}} is not set, expanded to empty string")
 
     whisper_cfg = raw.get("whisper", {})
 
@@ -581,6 +647,16 @@ def main():
     if not all_streams:
         print("[error] No streams configured")
         sys.exit(1)
+
+    # Broadcastify premium streams fail with 401 if credentials are missing;
+    # say so up front rather than looping on connection failures.
+    if any(url_needs_broadcastify_auth(s["url"]) for s in all_streams):
+        if broadcastify_auth_header():
+            print("[init] Broadcastify credentials: loaded from environment")
+        else:
+            print(f"[error] Broadcastify streams are configured but "
+                  f"${BROADCASTIFY_USER_ENV}/${BROADCASTIFY_PASS_ENV} are not set.")
+            sys.exit(1)
 
     # --- Locate whisper.cpp ---
     w_cfg = config["whisper"]

@@ -9,7 +9,7 @@
         "vancouver-island": {
             "outputs": {
                 "feed_url": "https://scanner-feed.ehxor.workers.dev",
-                "feed_token": ""
+                "feed_token": "${SCANNER_FEED_TOKEN_VANCOUVER_ISLAND}"
             },
 
             "streams": [
@@ -21,19 +21,19 @@
                 },
                 {
                     "name": "Cowichan Valley",
-                    "url": "https://broadcastify.cdnstream1.com/44935",
+                    "url": "https://audio.broadcastify.com/44935.mp3",
                     "jargon": "jargon.txt",
                     "tone_lookup": "tone_lookup_vancouver_island.json"
                 },
                 {
                     "name": "Comox Valley",
-                    "url": "https://broadcastify.cdnstream1.com/31760",
+                    "url": "https://audio.broadcastify.com/31760.mp3",
                     "jargon": "jargon.txt",
                     "tone_lookup": "tone_lookup_vancouver_island.json"
                 },
                 {
                     "name": "North Island",
-                    "url": "https://broadcastify.cdnstream1.com/21518",
+                    "url": "https://audio.broadcastify.com/21518.mp3",
                     "jargon": "jargon.txt",
                     "tone_lookup": "tone_lookup_vancouver_island.json"
                 }
@@ -228,7 +228,7 @@
         "interior": {
             "outputs": {
                 "feed_url": "https://scanner-feed-interior.ehxor.workers.dev",
-                "feed_token": ""
+                "feed_token": "${SCANNER_FEED_TOKEN_INTERIOR}"
             },
             "streams": [
                 {

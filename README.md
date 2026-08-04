@@ -57,6 +57,35 @@ npx wrangler deploy
 npx wrangler secret put INGEST_TOKEN  # Set your auth token
 ```
 
+## Secrets
+
+Secrets are kept out of `config.json` (which is tracked in git) and read from
+the environment instead. Any string in the config may reference an environment
+variable as `${VAR}`; unset variables expand to an empty string and log a
+warning at startup.
+
+Copy `.env.example` to `.env` (gitignored) and fill it in:
+
+```bash
+cp .env.example .env
+set -a; . ./.env; set +a
+python scanner_transcribe_gpu.py --config config.json
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `BROADCASTIFY_USERNAME` | Broadcastify premium login, for `audio.broadcastify.com` streams |
+| `BROADCASTIFY_PASSWORD` | Broadcastify premium password |
+| `SCANNER_FEED_TOKEN_VANCOUVER_ISLAND` | Ingest token for the Vancouver Island Worker feed |
+| `SCANNER_FEED_TOKEN_INTERIOR` | Ingest token for the Interior Worker feed |
+
+Broadcastify credentials are sent as an HTTP basic auth header rather than as
+userinfo in the stream URL, which keeps the plaintext password out of the
+process list. Basic auth is only base64, so treat this as obfuscation rather
+than protection on a shared host. If an `audio.broadcastify.com` stream is
+configured without credentials, the program exits with an error instead of
+retrying a 401 forever.
+
 ## Configuration
 
 Create a `config.json` (see `config.json` in this repo for an example):
@@ -213,13 +242,19 @@ python bc_wildfire_poller.py --polygon "-121.5,51.5 -119.0,51.5 -119.0,49.5 -121
 
 BC scanner streams (ScanBC, Broadcastify):
 
-| Region | URL |
-|--------|-----|
-| Nanaimo/Mid Island | `https://icecast0.scanbc.com/nanaimo` |
-| Kamloops | `https://icecast0.scanbc.com/kamloops` |
-| Cowichan Valley | `https://broadcastify.cdnstream1.com/44935` |
-| Comox Valley | `https://broadcastify.cdnstream1.com/31760` |
-| North Island | `https://broadcastify.cdnstream1.com/21518` |
+| Region | URL | Auth |
+|--------|-----|------|
+| Nanaimo/Mid Island | `https://icecast0.scanbc.com/nanaimo` | none |
+| Kamloops | `https://icecast0.scanbc.com/kamloops` | none |
+| Cowichan Valley | `https://audio.broadcastify.com/44935.mp3` | premium |
+| Comox Valley | `https://audio.broadcastify.com/31760.mp3` | premium |
+| North Island | `https://audio.broadcastify.com/21518.mp3` | premium |
+
+Broadcastify retired the old unauthenticated `broadcastify.cdnstream1.com/<id>`
+endpoints; that host no longer accepts connections, so those URLs fail with a
+TCP timeout. Live feeds now go through HLS in the browser player, or through
+the premium "Static URL" MP3 endpoints above, which is what this project uses.
+The feed IDs themselves are unchanged.
 
 ## License
 
