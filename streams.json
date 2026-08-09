@@ -6,17 +6,17 @@
     },
     {
         "name": "Cowichan Valley",
-        "url": "https://broadcastify.cdnstream1.com/44935",
+        "url": "https://audio.broadcastify.com/44935.mp3",
         "jargon": "jargon.txt"
     },
     {
         "name": "Comox Valley",
-        "url": "https://broadcastify.cdnstream1.com/31760",
+        "url": "https://audio.broadcastify.com/31760.mp3",
         "jargon": "jargon.txt"
     },
     {
         "name": "North Island",
-        "url": "https://broadcastify.cdnstream1.com/21518",
+        "url": "https://audio.broadcastify.com/21518.mp3",
         "jargon": "jargon.txt"
     }
 ]
