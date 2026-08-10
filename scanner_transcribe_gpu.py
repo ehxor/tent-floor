@@ -42,6 +42,8 @@ import urllib.request
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+
+from store import DEFAULT_DB_PATH, DEFAULT_RETENTION_DAYS, Store
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
@@ -527,6 +529,7 @@ def load_config(config_path):
 
     Returns a dict with:
         whisper: {bin, model, model_path}
+        store: {path, retention_days, enabled}
         groups: {group_name: {outputs: GroupOutputs, streams: [...], pollers: [...]}}
         all_streams: [{name, url, jargon_prompt, tone_lookup_path, group}]
     """
@@ -539,6 +542,13 @@ def load_config(config_path):
         print(f"[config] Warning: ${{{name}}} is not set, expanded to empty string")
 
     whisper_cfg = raw.get("whisper", {})
+
+    store_cfg = raw.get("store", {})
+    store_cfg = {
+        "path": store_cfg.get("path", DEFAULT_DB_PATH),
+        "retention_days": store_cfg.get("retention_days", DEFAULT_RETENTION_DAYS),
+        "enabled": store_cfg.get("enabled", True),
+    }
 
     groups = {}
     all_streams = []
@@ -579,9 +589,73 @@ def load_config(config_path):
 
     return {
         "whisper": whisper_cfg,
+        "store": store_cfg,
         "groups": groups,
         "all_streams": all_streams,
     }
+
+
+# ===================================================================
+# Cutover seeding
+# ===================================================================
+def seed_state(groups, store):
+    """Populate an empty store from one poll of each source, announcing nothing.
+
+    Only needed once, at cutover. The pollers no longer suppress their first
+    poll — that suppression is what used to lose incidents that appeared during
+    downtime — so starting against an empty database would treat everything
+    currently active as new and announce all of it. Seeding first avoids that
+    one-off flood. Running it against an already-populated store is harmless.
+    """
+    if store is None:
+        print("[seed] No state store configured; nothing to seed")
+        return
+
+    for group_name, group in groups.items():
+        for poller_cfg in group["pollers"]:
+            ptype = poller_cfg["type"]
+            scope = f"{group_name}:{ptype}"
+            try:
+                if ptype == "pulsepoint":
+                    from pulsepoint_poller import IncidentTracker, fetch_incidents
+                    active, _ = fetch_incidents(poller_cfg["agency"])
+                    if active is None:
+                        print(f"[seed] [{group_name}] pulsepoint: no data returned")
+                        continue
+                    tracker = IncidentTracker(
+                        unit_prefixes=poller_cfg.get("unit_prefix"), store=store,
+                        scope=scope, agency=poller_cfg["agency"])
+                    count = len(tracker.update(active))
+
+                elif ptype == "nanaimo_fire":
+                    from nanaimo_fire_poller import NanaimoFireTracker, fetch_incidents
+                    features = fetch_incidents()
+                    if features is None:
+                        print(f"[seed] [{group_name}] nanaimo_fire: no data returned")
+                        continue
+                    count = len(NanaimoFireTracker(store=store, scope=scope)
+                                .update(features))
+
+                elif ptype == "bc_wildfire":
+                    from bc_wildfire_poller import (BCWildfireTracker,
+                                                    fetch_incidents, parse_polygon)
+                    polygon_cfg = poller_cfg.get("polygon")
+                    polygon = parse_polygon(polygon_cfg) if polygon_cfg else None
+                    incidents = fetch_incidents(poller_cfg.get("fire_centre_code"))
+                    if incidents is None:
+                        print(f"[seed] [{group_name}] bc_wildfire: no data returned")
+                        continue
+                    count = len(BCWildfireTracker(polygon=polygon, store=store,
+                                                  scope=scope).update(incidents))
+                else:
+                    print(f"[seed] [{group_name}] Unknown poller type: {ptype}")
+                    continue
+
+                print(f"[seed] [{group_name}] {ptype}: absorbed {count} record(s)")
+            except Exception as e:
+                print(f"[seed] [{group_name}] {ptype} failed: {e}", file=sys.stderr)
+
+    print("[seed] Done. Start normally — only genuinely new activity is reported.")
 
 
 # ===================================================================
@@ -601,6 +675,14 @@ def main():
     parser.add_argument("--no-tones", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--debug-vad", action="store_true")
+    parser.add_argument("--no-store", action="store_true",
+                        help="Disable durable state. Change detection falls back "
+                             "to memory, so a restart re-announces everything.")
+    parser.add_argument("--seed", action="store_true",
+                        help="Populate the state store from one poll of each "
+                             "source and exit, announcing nothing. Run this once "
+                             "at cutover so the first real start does not report "
+                             "every currently-active incident as new.")
     # Legacy single-output flags (used in single-stream mode)
     parser.add_argument("--discord-webhook")
     parser.add_argument("--feed-url")
@@ -635,6 +717,9 @@ def main():
                     "pollers": [],
                 }
             },
+            "store": {"path": DEFAULT_DB_PATH,
+                      "retention_days": DEFAULT_RETENTION_DAYS,
+                      "enabled": True},
             "all_streams": [{
                 "name": "Scanner",
                 "url": args.stream_url,
@@ -647,6 +732,31 @@ def main():
 
     all_streams = config["all_streams"]
     groups = config["groups"]
+
+    # --- State store ---
+    # Shared by every poller for change detection. Without it each poller falls
+    # back to in-memory state, which is what made restarts either replay every
+    # active incident or silently swallow whatever happened during downtime.
+    store_cfg = config["store"]
+    store = None
+    if store_cfg["enabled"] and not args.no_store:
+        try:
+            store = Store(store_cfg["path"],
+                          retention_days=store_cfg["retention_days"])
+            swept = store.sweep()
+            print(f"[init] State store: {store_cfg['path']} "
+                  f"(retention {store_cfg['retention_days']}d"
+                  + (f", swept {swept} row(s)" if swept else "") + ")")
+        except Exception as e:
+            print(f"[warn] State store unavailable ({e}); "
+                  f"falling back to in-memory change detection")
+            store = None
+    else:
+        print("[init] State store: disabled (in-memory change detection)")
+
+    if args.seed:
+        seed_state(groups, store)
+        return
 
     if not all_streams:
         print("[error] No streams configured")
@@ -759,7 +869,8 @@ def main():
                         return cb
 
                     pp = PulsePointPoller(agency_id=agency, unit_prefixes=prefixes,
-                                          callback=make_pp_cb(out, group_name))
+                                          callback=make_pp_cb(out, group_name),
+                                          store=store, scope=f"{group_name}:pulsepoint")
                     pp.start()
                     all_pollers.append(pp)
                     print(f"[init] [{group_name}] PulsePoint poller started (agency: {agency})")
@@ -778,7 +889,9 @@ def main():
                             o.send_all(nf_fmt(event), nf_fmt_d(event), line_type="nanaimo_fire")
                         return cb
 
-                    nf = NanaimoFirePoller(callback=make_nf_cb(out, group_name))
+                    nf = NanaimoFirePoller(callback=make_nf_cb(out, group_name),
+                                           store=store,
+                                           scope=f"{group_name}:nanaimo_fire")
                     nf.start()
                     all_pollers.append(nf)
                     print(f"[init] [{group_name}] Nanaimo Fire poller started")
@@ -805,7 +918,9 @@ def main():
 
                     wf = BCWildfirePoller(polygon=polygon,
                                           fire_centre_code=fire_centre,
-                                          callback=make_wf_cb(out, group_name))
+                                          callback=make_wf_cb(out, group_name),
+                                          store=store,
+                                          scope=f"{group_name}:bc_wildfire")
                     wf.start()
                     all_pollers.append(wf)
                     scope = f"{len(polygon)} point polygon" if polygon else "no polygon filter"

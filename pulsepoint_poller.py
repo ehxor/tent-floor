@@ -28,6 +28,8 @@ import threading
 import urllib.request
 from datetime import datetime
 
+from store import Store
+
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.backends import default_backend
@@ -182,19 +184,36 @@ def _status_label(code):
 
 
 class IncidentTracker:
-    """Track PulsePoint incidents and emit events on state changes."""
+    """Track PulsePoint incidents and emit events on state changes.
 
-    def __init__(self, unit_prefixes=None):
+    Two levels of reconciliation against the store: incidents drive
+    new_incident and incident_cleared, and the units on those incidents drive
+    unit_added and unit_status_change. Both survive a restart, so coming back
+    up no longer re-announces every active incident.
+    """
+
+    def __init__(self, unit_prefixes=None, store=None, scope="", agency=None):
         """
         Args:
             unit_prefixes: List of prefixes to match against unit IDs.
                           Matching is done against the unit ID directly.
                           e.g., ["1"] matches "140A1D", "105A1D", "1Q3", etc.
                           None means track all incidents.
+            store: a store.Store. Defaults to an in-memory one, which gives
+                the pre-store behaviour of forgetting everything on exit.
+            scope: isolates this tracker's rows. The shipped config polls one
+                agency twice with different prefixes, and those two views must
+                not treat each other's incidents as cleared.
+            agency: recorded on incident rows; not used for matching.
         """
         self.unit_prefixes = unit_prefixes
-        self.known_incidents = {}  # incident_id -> last known incident dict
-        self.known_units = {}     # incident_id -> {unit_id: last_status_code}
+        self.agency = agency
+        self.store = store if store is not None else Store(":memory:")
+        self.incidents = self.store.reconciler(
+            "pulsepoint_incidents", key=("incident_id",), scope=scope)
+        self.units = self.store.reconciler(
+            "pulsepoint_units", key=("incident_id", "unit_id"),
+            tracked=("status_code",), scope=scope)
 
     def _unit_matches(self, unit_id):
         """Check if a unit ID matches any of our prefixes."""
@@ -202,101 +221,147 @@ class IncidentTracker:
             return True
         return any(unit_id.startswith(p) for p in self.unit_prefixes)
 
+    @staticmethod
+    def _unit_list(incident):
+        return [{"id": u.get("UnitID", ""),
+                 "status": u.get("PulsePointDispatchStatus", "")}
+                for u in incident.get("Unit", [])]
+
+    def _to_row(self, incident, incident_id):
+        """Map an incident onto pulsepoint_incidents columns.
+
+        call_type_code and address hold the raw API values, with no defaults
+        applied. The defaults differ between a live event ("Unknown location")
+        and a cleared one ("Unknown"), so applying them here would change the
+        text of cleared events.
+        """
+        code = incident.get("PulsePointIncidentCallType")
+        return {
+            "incident_id": incident_id,
+            "agency": self.agency,
+            "call_type_code": code,
+            "call_type": CALL_TYPES.get(code, code),
+            "address": incident.get("FullDisplayAddress"),
+            "call_time": incident.get("CallReceivedDateTime"),
+            "raw": json.dumps(incident, sort_keys=True, default=str),
+        }
+
     def update(self, active_incidents):
         """Process active incidents and return list of events."""
         if active_incidents is None:
             return []
 
-        events = []
-        current_ids = set()
+        incident_rows = []
+        unit_rows = []
+        snapshot = {}
+        order = []
 
         for incident in active_incidents:
             incident_id = incident.get("ID")
             if not incident_id:
                 continue
 
-            # Extract units
-            units = incident.get("Unit", [])
-            unit_list = []
-            for u in units:
-                uid = u.get("UnitID", "")
-                status = u.get("PulsePointDispatchStatus", "")
-                unit_list.append({"id": uid, "status": status})
+            unit_list = self._unit_list(incident)
 
-            # Filter by unit prefix
-            if self.unit_prefixes:
-                matching = [u for u in unit_list if self._unit_matches(u["id"])]
-                if not matching:
-                    continue
+            # An incident with no matching unit is skipped entirely, so it
+            # falls out of the snapshot and reads as cleared. Pre-existing
+            # behaviour, preserved.
+            if self.unit_prefixes and not any(self._unit_matches(u["id"])
+                                              for u in unit_list):
+                continue
 
-            current_ids.add(incident_id)
+            snapshot[incident_id] = (incident, unit_list)
+            order.append(incident_id)
+            incident_rows.append(self._to_row(incident, incident_id))
+            for unit in unit_list:
+                unit_rows.append({
+                    "incident_id": incident_id,
+                    "unit_id": unit["id"],
+                    "status_code": unit["status"],
+                    "status_label": _status_label(unit["status"]),
+                })
 
+        incident_changes = self.incidents.sync(incident_rows)
+        new_ids = {c.key[0] for c in incident_changes
+                   if c.kind in ("appeared", "reappeared")}
+        cleared = [c for c in incident_changes if c.kind == "disappeared"]
+
+        # Confine unit disappearance detection to the incidents in this
+        # snapshot — a unit is not gone just because its incident was not
+        # part of this poll's matching set.
+        if order:
+            marks = ", ".join("?" * len(order))
+            unit_scope = (f"incident_id IN ({marks})", order)
+        else:
+            unit_scope = ("0 = 1", [])
+        unit_changes = self.units.sync(unit_rows, within=unit_scope)
+
+        # Units of a cleared incident go with it, so that if the incident
+        # comes back its units read as freshly added.
+        for change in cleared:
+            self.units.mark_gone_where("incident_id = ?", [change.key[0]])
+
+        by_incident = {}
+        for change in unit_changes:
+            by_incident.setdefault(change.key[0], []).append(change)
+
+        # Emit in the order the old tracker did: per incident in snapshot
+        # order, then clears.
+        events = []
+        for incident_id in order:
+            incident, unit_list = snapshot[incident_id]
             call_type_code = incident.get("PulsePointIncidentCallType", "UNK")
             call_type = CALL_TYPES.get(call_type_code, call_type_code)
             address = incident.get("FullDisplayAddress", "Unknown location")
-            call_time = incident.get("CallReceivedDateTime", "")
-            unit_ids = [u["id"] for u in unit_list]
-            unit_summary = ", ".join(unit_ids) if unit_ids else "No units"
 
-            # New incident?
-            if incident_id not in self.known_incidents:
+            if incident_id in new_ids:
+                unit_ids = [u["id"] for u in unit_list]
                 events.append({
                     "type": "new_incident",
                     "incident_id": incident_id,
                     "call_type": call_type,
                     "call_type_code": call_type_code,
                     "address": address,
-                    "call_time": call_time,
-                    "units": unit_summary,
+                    "call_time": incident.get("CallReceivedDateTime", ""),
+                    "units": ", ".join(unit_ids) if unit_ids else "No units",
                     "unit_list": unit_list,
                 })
-                self.known_incidents[incident_id] = incident
-                self.known_units[incident_id] = {u["id"]: u["status"] for u in unit_list}
                 continue
 
-            # Existing incident — check for changes
-            prev_units = self.known_units.get(incident_id, {})
-            for unit in unit_list:
-                uid = unit["id"]
-                new_status = unit["status"]
-                old_status = prev_units.get(uid)
-
-                if old_status is None:
+            for change in by_incident.get(incident_id, []):
+                if change.kind in ("appeared", "reappeared"):
                     events.append({
                         "type": "unit_added",
                         "incident_id": incident_id,
                         "call_type": call_type,
                         "address": address,
-                        "unit_id": uid,
-                        "status": _status_label(new_status),
+                        "unit_id": change.key[1],
+                        "status": _status_label(change.after["status_code"]),
                     })
-                elif new_status != old_status:
+                elif change.kind == "changed":
+                    diff = change.changed_fields["status_code"]
                     events.append({
                         "type": "unit_status_change",
                         "incident_id": incident_id,
                         "call_type": call_type,
                         "address": address,
-                        "unit_id": uid,
-                        "old_status": _status_label(old_status),
-                        "new_status": _status_label(new_status),
+                        "unit_id": change.key[1],
+                        "old_status": _status_label(diff["old"]),
+                        "new_status": _status_label(diff["new"]),
                     })
+                # A unit dropping off an incident emits nothing, as before.
 
-            self.known_incidents[incident_id] = incident
-            self.known_units[incident_id] = {u["id"]: u["status"] for u in unit_list}
-
-        # Cleared incidents
-        cleared = set(self.known_incidents.keys()) - current_ids
-        for incident_id in cleared:
-            old = self.known_incidents[incident_id]
-            call_type_code = old.get("PulsePointIncidentCallType", "UNK")
+        for change in cleared:
+            before = change.before
+            code = before["call_type_code"]
+            code = "UNK" if code is None else code
+            address = before["address"]
             events.append({
                 "type": "incident_cleared",
-                "incident_id": incident_id,
-                "call_type": CALL_TYPES.get(call_type_code, call_type_code),
-                "address": old.get("FullDisplayAddress", "Unknown"),
+                "incident_id": change.key[0],
+                "call_type": CALL_TYPES.get(code, code),
+                "address": "Unknown" if address is None else address,
             })
-            del self.known_incidents[incident_id]
-            del self.known_units[incident_id]
 
         return events
 
@@ -347,9 +412,21 @@ class PulsePointPoller:
     """Background thread that polls PulsePoint and calls a callback with events."""
 
     def __init__(self, agency_id, unit_prefixes=None, callback=None,
-                 poll_interval=POLL_INTERVAL_S):
+                 poll_interval=POLL_INTERVAL_S, store=None, scope=""):
+        """
+        Args:
+            agency_id: PulsePoint agency ID (e.g. EMS1201).
+            unit_prefixes: optional list of unit ID prefixes to filter on.
+            callback: function called with each event dict.
+            poll_interval: seconds between polls.
+            store: a store.Store for durable change detection. Without one,
+                every restart re-announces all active incidents.
+            scope: isolates this poller's rows. Two pollers on the same agency
+                with different prefixes need different scopes.
+        """
         self.agency_id = agency_id
-        self.tracker = IncidentTracker(unit_prefixes=unit_prefixes)
+        self.tracker = IncidentTracker(unit_prefixes=unit_prefixes, store=store,
+                                       scope=scope, agency=agency_id)
         self.callback = callback
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
