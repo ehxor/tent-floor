@@ -5,6 +5,12 @@
         "model_path": null
     },
 
+    "store": {
+        "path": "tentfloor.db",
+        "retention_days": 30,
+        "enabled": true
+    },
+
     "groups": {
         "vancouver-island": {
             "outputs": {

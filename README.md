@@ -10,6 +10,7 @@ Live transcription and monitoring of emergency radio scanner streams with two-to
 - **Nanaimo Fire API**: Monitors Nanaimo Fire Rescue's public incident feed
 - **BC Wildfire Tracking**: Polls BC Wildfire Service for wildfire incidents within a configurable geographic polygon, tracking status, size, and fire-of-note changes
 - **Multi-Stream Support**: Process multiple scanner streams simultaneously with group-based configuration
+- **Durable State**: Shared sqlite store so pollers survive restarts without replaying or dropping incidents
 - **Web Feed**: Cloudflare Workers-based live feed with auto-refresh UI
 - **Discord Integration**: Optional Discord webhook notifications
 
@@ -133,6 +134,9 @@ Create a `config.json` (see `config.json` in this repo for an example):
 |-------|-------------|
 | `whisper.bin` | Path to whisper-cli binary (auto-detected if omitted) |
 | `whisper.model` | Model name (default: `large-v3`) |
+| `store.path` | Sqlite file holding poller state (default: `tentfloor.db`) |
+| `store.retention_days` | How long to keep records after they leave a feed (default: `30`) |
+| `store.enabled` | Set `false` to fall back to in-memory change detection |
 | `groups` | Named groups of streams + outputs |
 | `outputs.feed_url` | Cloudflare Worker URL for web feed |
 | `outputs.feed_token` | Bearer token for feed ingestion (use `${VAR}`, see [Secrets](#secrets)) |
@@ -153,12 +157,45 @@ Polls the BC Wildfire Service API every 10 minutes for active wildfires, filtere
 
 If `polygon` is set, only fires whose coordinates fall inside it are tracked. Use `--dump` in standalone mode to test your polygon against live data.
 
+## State Store
+
+Every poller detects change by comparing the current poll against what it saw last time. That comparison state lives in a single sqlite file (`store.path`), shared by all of them.
+
+Without it, each poller had to choose between two wrong behaviours on restart: PulsePoint re-announced every active incident, while Nanaimo Fire and BC Wildfire silently swallowed their entire first poll and lost anything that appeared while the process was down. With durable state, neither is necessary — a restart reports exactly what changed while you were away.
+
+Each poller gets its own `scope` within the shared tables, derived from its group and type. That matters because the shipped config watches the same PulsePoint agency twice with different unit prefixes; without scoping, those two views would each treat the other's incidents as missing and flap between cleared and re-declared on every poll.
+
+Records stay queryable after they leave a feed — `gone_at` is set rather than the row deleted — and a sweep at startup drops anything gone longer than `retention_days`.
+
+### First run
+
+The pollers no longer suppress their first poll, so starting against an empty database treats everything currently active as new. Seed it once at cutover:
+
+```bash
+python scanner_transcribe_gpu.py --config config.json --seed
+```
+
+That runs one poll of each source, records the results, and announces nothing. Then start normally. Running `--seed` again later is harmless.
+
+### Inspecting
+
+```bash
+python store.py --db tentfloor.db            # row counts per table
+python store.py --db tentfloor.db --sweep    # force a retention sweep
+
+sqlite3 tentfloor.db \
+  "SELECT name, stage_code, size_ha FROM wildfires WHERE gone_at IS NULL"
+```
+
+Pass `--no-store` (or set `store.enabled` to `false`) to run without it. Change detection then falls back to memory and restarts re-announce everything — the pre-store behaviour.
+
 ## Usage
 
 Run with config file (recommended):
 
 ```bash
 set -a; . ./.env; set +a          # load secrets (see Secrets above)
+python scanner_transcribe_gpu.py --config config.json --seed   # first run only
 python scanner_transcribe_gpu.py --config config.json
 ```
 
@@ -239,6 +276,30 @@ Run BC Wildfire poller alone (polygon defines the area of interest):
 python bc_wildfire_poller.py --polygon "-121.5,51.5 -119.0,51.5 -119.0,49.5 -121.5,49.5" --dump
 python bc_wildfire_poller.py --polygon "-121.5,51.5 -119.0,51.5 -119.0,49.5 -121.5,49.5" --fire-centre 50
 ```
+
+## Tests
+
+Stdlib `unittest`, no dependencies beyond what the project already needs:
+
+```bash
+python -m unittest discover tests
+```
+
+The suite covers the shared reconciliation machinery (`tests/test_store.py`), restart and scope-isolation semantics (`tests/test_restart.py`), and equivalence against the pre-store trackers (`tests/test_equivalence.py`).
+
+That last one is the important one. `tests/legacy_trackers.py` holds frozen copies of the tracker classes as they were before the sqlite port, and the equivalence tests replay the same snapshots through both, asserting the emitted events — and their formatted Discord and feed output — match exactly.
+
+Those tests run against synthetic snapshots built from the fields each poller reads. To validate against what the APIs actually return, capture real ones:
+
+```bash
+python tools/capture_fixtures.py --source pulsepoint --agency EMS1201
+sleep 120
+python tools/capture_fixtures.py --source pulsepoint --agency EMS1201
+
+python tools/capture_fixtures.py --replay fixtures/pulsepoint --unit-prefix 1
+```
+
+Capture a few snapshots minutes apart so consecutive files contain real transitions. `--replay` feeds them through both trackers and prints any divergence. Once it passes on real data for all three sources, `tests/legacy_trackers.py` has done its job and can be deleted.
 
 ## Sample Streams
 

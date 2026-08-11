@@ -1,3 +1,14 @@
 whisper.cpp/
 __pycache__/
 .env
+
+# State store (sqlite, plus its WAL sidecars)
+*.db
+*.db-wal
+*.db-shm
+
+# Captured API snapshots for equivalence testing
+fixtures/
+
+# Unknown two-tone pages, appended at runtime for growing the lookup tables
+unknown_tones_*.log

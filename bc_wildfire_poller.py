@@ -23,6 +23,8 @@ import threading
 import urllib.request
 from datetime import datetime
 
+from store import Store
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -56,13 +58,22 @@ STAGE_LABELS = {
     "OUT": "Out",
 }
 
-# Fields we track for changes
+# Fields we track for changes, in the order they appear in update events.
 TRACKED_FIELDS = [
     "stageOfControlCode",
     "incidentSizeEstimatedHa",
     "fireOfNoteInd",
     "incidentName",
 ]
+
+# API field name -> column in the `wildfires` table. Events keep the API
+# names so the formatters below are unaffected by the storage schema.
+TRACKED_COLUMNS = {
+    "stageOfControlCode": "stage_code",
+    "incidentSizeEstimatedHa": "size_ha",
+    "fireOfNoteInd": "fire_of_note",
+    "incidentName": "name",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -200,16 +211,34 @@ def fetch_incidents(fire_centre_code=None):
 # Incident tracker
 # ---------------------------------------------------------------------------
 class BCWildfireTracker:
-    """Track BC wildfire incidents within a polygon and emit change events."""
+    """Track BC wildfire incidents within a polygon and emit change events.
 
-    def __init__(self, polygon=None):
+    Change detection is delegated to store.Reconciler against the `wildfires`
+    table, so tracked state survives a restart. Event payloads are still built
+    from the incoming incident rather than from storage, which keeps the exact
+    values the API sent (an integer hectare figure stays an integer).
+    """
+
+    def __init__(self, polygon=None, store=None, scope=""):
         """
         Args:
             polygon: optional list of (lat, lon) tuples defining the area of
                 interest. If None, all incidents are tracked.
+            store: a store.Store. Defaults to an in-memory one, which gives
+                the pre-store behaviour of forgetting everything on exit —
+                handy for --dump and tests.
+            scope: isolates this tracker's rows from other wildfire trackers
+                sharing the store. Two groups watching different fire centres
+                must not see each other's fires as missing.
         """
         self.polygon = polygon
-        self.known_incidents = {}  # incidentGuid -> dict of tracked field values
+        self.store = store if store is not None else Store(":memory:")
+        self.recon = self.store.reconciler(
+            "wildfires",
+            key=("guid",),
+            tracked=tuple(TRACKED_COLUMNS[f] for f in TRACKED_FIELDS),
+            scope=scope,
+        )
 
     def _in_area(self, incident):
         """Check if incident location falls within our polygon."""
@@ -222,102 +251,114 @@ class BCWildfireTracker:
             return False
         return point_in_polygon(lat, lon, self.polygon)
 
-    def _tracked_snapshot(self, incident):
-        """Extract the tracked fields from an incident."""
-        return {f: incident.get(f) for f in TRACKED_FIELDS}
+    def _to_row(self, incident):
+        """Map an API incident onto the `wildfires` columns.
+
+        Tracked columns hold the raw API values (no defaults applied), so the
+        change comparison sees exactly what the old snapshot dict saw.
+        """
+        return {
+            "guid": incident.get("incidentGuid"),
+            "label": incident.get("incidentNumberLabel", ""),
+            "name": incident.get("incidentName"),
+            "fire_year": incident.get("fireYear"),
+            "stage_code": incident.get("stageOfControlCode"),
+            "size_ha": incident.get("incidentSizeEstimatedHa"),
+            "fire_of_note": incident.get("fireOfNoteInd"),
+            "fire_centre": incident.get("fireCentreName", ""),
+            "lat": incident.get("latitude"),
+            "lon": incident.get("longitude"),
+            "raw": json.dumps(incident, sort_keys=True, default=str),
+        }
+
+    def _base_event(self, incident):
+        """The fields shared by declared and update events."""
+        fire_lat = incident.get("latitude")
+        fire_lon = incident.get("longitude")
+        try:
+            town_name, town_dist = nearest_town(float(fire_lat), float(fire_lon))
+        except (TypeError, ValueError):
+            town_name, town_dist = None, None
+
+        return {
+            "guid": incident.get("incidentGuid"),
+            "name": incident.get("incidentName", "Unknown"),
+            "label": incident.get("incidentNumberLabel", ""),
+            "fire_year": incident.get("fireYear"),
+            "stage": STAGE_LABELS.get(
+                incident.get("stageOfControlCode", ""),
+                incident.get("stageOfControlCode", "Unknown")
+            ),
+            "size_ha": incident.get("incidentSizeEstimatedHa"),
+            "fire_of_note": incident.get("fireOfNoteInd", False),
+            "fire_centre": incident.get("fireCentreName", ""),
+            "nearest_town": town_name,
+            "nearest_town_km": town_dist,
+        }
+
+    @staticmethod
+    def _changes_to_api_fields(changed_columns):
+        """Translate reconciler column diffs back to API field names.
+
+        fireOfNoteInd round-trips through an INTEGER column, so restore the
+        bool — consumers of the event should not have to know the schema.
+        """
+        changes = {}
+        for field in TRACKED_FIELDS:
+            column = TRACKED_COLUMNS[field]
+            if column not in changed_columns:
+                continue
+            diff = changed_columns[column]
+            if field == "fireOfNoteInd":
+                changes[field] = {
+                    "old": None if diff["old"] is None else bool(diff["old"]),
+                    "new": None if diff["new"] is None else bool(diff["new"]),
+                }
+            else:
+                changes[field] = {"old": diff["old"], "new": diff["new"]}
+        return changes
 
     def update(self, incidents):
         """Process incidents and return list of events."""
         if incidents is None:
             return []
 
-        events = []
-        current_ids = set()
-
+        rows = []
+        by_guid = {}
         for incident in incidents:
             guid = incident.get("incidentGuid")
             if not guid:
                 continue
-
             if not self._in_area(incident):
                 continue
+            by_guid[guid] = incident
+            rows.append(self._to_row(incident))
 
-            current_ids.add(guid)
-            snapshot = self._tracked_snapshot(incident)
-            name = incident.get("incidentName", "Unknown")
-            label = incident.get("incidentNumberLabel", "")
-            fire_year = incident.get("fireYear")
-            stage = STAGE_LABELS.get(
-                incident.get("stageOfControlCode", ""),
-                incident.get("stageOfControlCode", "Unknown")
-            )
-            size_ha = incident.get("incidentSizeEstimatedHa")
-            fire_of_note = incident.get("fireOfNoteInd", False)
-            fire_centre = incident.get("fireCentreName", "")
+        events = []
+        for change in self.recon.sync(rows):
+            guid = change.key[0]
 
-            fire_lat = incident.get("latitude")
-            fire_lon = incident.get("longitude")
-            try:
-                town_name, town_dist = nearest_town(float(fire_lat), float(fire_lon))
-            except (TypeError, ValueError):
-                town_name, town_dist = None, None
+            # A fire that dropped out of the feed and came back is a genuine
+            # new declaration — the pre-store tracker forgot it on removal.
+            if change.kind in ("appeared", "reappeared"):
+                event = self._base_event(by_guid[guid])
+                event["type"] = "wildfire_declared"
+                event["latitude"] = by_guid[guid].get("latitude")
+                event["longitude"] = by_guid[guid].get("longitude")
+                events.append(event)
 
-            if guid not in self.known_incidents:
+            elif change.kind == "changed":
+                event = self._base_event(by_guid[guid])
+                event["type"] = "wildfire_update"
+                event["changes"] = self._changes_to_api_fields(change.changed_fields)
+                events.append(event)
+
+            elif change.kind == "disappeared":
                 events.append({
-                    "type": "wildfire_declared",
+                    "type": "wildfire_removed",
                     "guid": guid,
-                    "name": name,
-                    "label": label,
-                    "fire_year": fire_year,
-                    "stage": stage,
-                    "size_ha": size_ha,
-                    "fire_of_note": fire_of_note,
-                    "fire_centre": fire_centre,
-                    "latitude": fire_lat,
-                    "longitude": fire_lon,
-                    "nearest_town": town_name,
-                    "nearest_town_km": town_dist,
+                    "name": change.before.get("name"),
                 })
-                self.known_incidents[guid] = snapshot
-                continue
-
-            # Check for changes in tracked fields
-            prev = self.known_incidents[guid]
-            changes = {}
-            for field in TRACKED_FIELDS:
-                if snapshot[field] != prev[field]:
-                    changes[field] = {
-                        "old": prev[field],
-                        "new": snapshot[field],
-                    }
-
-            if changes:
-                events.append({
-                    "type": "wildfire_update",
-                    "guid": guid,
-                    "name": name,
-                    "label": label,
-                    "fire_year": fire_year,
-                    "stage": stage,
-                    "size_ha": size_ha,
-                    "fire_of_note": fire_of_note,
-                    "fire_centre": fire_centre,
-                    "changes": changes,
-                    "nearest_town": town_name,
-                    "nearest_town_km": town_dist,
-                })
-                self.known_incidents[guid] = snapshot
-
-        # Fires no longer in the feed (resolved / removed)
-        gone = set(self.known_incidents.keys()) - current_ids
-        for guid in gone:
-            prev = self.known_incidents[guid]
-            events.append({
-                "type": "wildfire_removed",
-                "guid": guid,
-                "name": prev.get("incidentName", "Unknown"),
-            })
-            del self.known_incidents[guid]
 
         return events
 
@@ -410,7 +451,7 @@ class BCWildfirePoller:
     """Background thread that polls BC Wildfire API and calls a callback."""
 
     def __init__(self, polygon=None, fire_centre_code=None, callback=None,
-                 poll_interval=POLL_INTERVAL_S):
+                 poll_interval=POLL_INTERVAL_S, store=None, scope=""):
         """
         Args:
             polygon: optional list of (lat, lon) tuples defining the area of
@@ -418,14 +459,15 @@ class BCWildfirePoller:
             fire_centre_code: optional fire centre code to filter API query.
             callback: function called with each event dict.
             poll_interval: seconds between polls (default 600 = 10 min).
+            store: a store.Store for durable change detection. Without one,
+                state is in-memory and every restart re-declares active fires.
         """
-        self.tracker = BCWildfireTracker(polygon=polygon)
+        self.tracker = BCWildfireTracker(polygon=polygon, store=store, scope=scope)
         self.fire_centre_code = fire_centre_code
         self.callback = callback
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
         self.thread = None
-        self._initial_load = True
 
     def start(self):
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
@@ -439,14 +481,10 @@ class BCWildfirePoller:
             try:
                 incidents = fetch_incidents(self.fire_centre_code)
                 if incidents is not None:
-                    events = self.tracker.update(incidents)
-
-                    # On first load, silently absorb existing incidents
-                    if self._initial_load:
-                        self._initial_load = False
-                        continue
-
-                    for event in events:
+                    # No first-poll suppression: the store already knows which
+                    # fires were seen before this process started, so anything
+                    # reported here is genuinely new.
+                    for event in self.tracker.update(incidents):
                         if self.callback:
                             self.callback(event)
             except Exception as e:
