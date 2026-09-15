@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # cffi is not declared in requirements.txt but cryptography's compiled
+        # bindings need it at import time, and pulsepoint_poller imports
+        # cryptography at module scope. Without it the poller tests fail to
+        # collect rather than fail to pass, which is a confusing way to find out.
+        run: |
+          python -m pip install --upgrade pip
+          pip install cffi
+          pip install -r requirements.txt
+
+      - name: Byte-compile
+        # Most of scanner_transcribe_gpu.py needs a GPU, whisper.cpp and a live
+        # stream, so it is not unit tested. This at least catches a syntax error
+        # or a botched edit before it reaches the box running the scanner.
+        run: python -m compileall -q *.py
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
