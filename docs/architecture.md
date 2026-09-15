@@ -260,9 +260,30 @@ get to grow the database without limit. But it reports how many unconsumed
 events it dropped, because silently discarding a dead output's backlog is how
 you find out about it six weeks later.
 
-**Phase 2 — decouple outputs.** Each output becomes a worker thread reading
-forward by cursor, with its own backoff and failure counter. The bare
-`except: pass` handlers go away, and the dropped-transmission path with them.
+**Phase 2 — decouple outputs.** *Landed.* Each destination is an
+`outputs.OutputWorker` thread reading forward from its own cursor
+(`<group>:<kind>`), so emitting is an append and nothing more. One thread per
+destination preserves ordering without coordination, and a stalled destination
+stalls only itself.
+
+Failures are split into the two kinds that call for different handling.
+A `RetryableFailure` — connection refused, timeout, 5xx, or a 429 whose
+`Retry-After` is honoured — is retried with backoff indefinitely, because the
+whole point is to fall behind rather than lose data. A `PermanentFailure` —
+any other 4xx, so a rotated feed token or a deleted webhook — is logged loudly
+and skipped, because retrying it forever would wedge every event queued behind
+it.
+
+Failure reporting is loud on the way down and on recovery, quiet in between,
+which is the opposite of the previous `except: pass`.
+
+`wildfire.removed` is now recorded in the log and suppressed at the
+destinations (`outputs.SUPPRESSED_TYPES`) rather than never being emitted. The
+outward behaviour is unchanged; the log becomes a complete record of what was
+seen.
+
+Without a store there is nowhere to queue, so `--no-store` keeps the old
+blocking inline sends as an explicitly degraded path.
 
 **Phase 3 — audio clips.** Opus encoding, `clips` table, `audio` block in the
 envelope, 7 day local sweep, R2 for the served copy.

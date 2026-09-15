@@ -518,12 +518,14 @@ class EventLog:
             self.store.conn.commit()
         return seq
 
-    def read_after(self, seq, limit=100, tiers=None):
+    def read_after(self, seq, limit=100, tiers=None, group=None):
         """Events with seq strictly greater than `seq`, oldest first.
 
         Returns (seq, envelope) pairs. `tiers` restricts to a set of tiers —
         the edge uses it to serve a public reader without loading sensitive
-        bodies it is only going to discard.
+        bodies it is only going to discard. `group` restricts to one group's
+        events, which is how each output worker sees only its own destination's
+        traffic while sharing a single log.
         """
         sql = "SELECT seq, body FROM events WHERE seq > ?"
         params = [seq]
@@ -531,6 +533,9 @@ class EventLog:
             tiers = list(tiers)
             sql += f" AND tier IN ({', '.join('?' * len(tiers))})"
             params.extend(tiers)
+        if group is not None:
+            sql += " AND group_name = ?"
+            params.append(group)
         sql += " ORDER BY seq LIMIT ?"
         params.append(limit)
         with self.store.lock:

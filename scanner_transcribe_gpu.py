@@ -44,6 +44,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import events
+import outputs
 from store import DEFAULT_DB_PATH, DEFAULT_RETENTION_DAYS, Store
 
 # ---------------------------------------------------------------------------
@@ -85,29 +86,16 @@ COLOR_BOLD = "\033[1m"
 # ===================================================================
 # Output helpers
 # ===================================================================
-def send_to_discord(message, webhook_url):
-    if not webhook_url:
-        return
-    data = json.dumps({"content": message}).encode("utf-8")
-    req = urllib.request.Request(webhook_url, data=data,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "ScannerFeed/1.0"})
-    try:
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass
+def _post_inline(url, payload, headers):
+    """Blocking POST used only when the event log is unavailable.
 
-
-def send_to_feed(message, feed_url, feed_token, line_type="transcript"):
-    if not feed_url:
-        return
-    data = json.dumps({"line": message, "type": line_type}).encode("utf-8")
-    req = urllib.request.Request(feed_url.rstrip("/") + "/ingest", data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {feed_token}",
-            "User-Agent": "ScannerFeed/1.0",
-        })
+    With a log, delivery belongs to the workers in outputs.py. Without one
+    (--no-store, or a store that failed to open) there is nowhere to queue, so
+    the old inline behaviour is kept as the degraded path — including its habit
+    of swallowing failures, because there is no cursor to retry from.
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         urllib.request.urlopen(req, timeout=5)
     except Exception:
@@ -117,35 +105,47 @@ def send_to_feed(message, feed_url, feed_token, line_type="transcript"):
 class GroupOutputs:
     """Holds output destinations for a group."""
     def __init__(self, discord_webhook=None, feed_url=None, feed_token=None,
-                 event_log=None):
+                 event_log=None, manager=None):
         self.discord_webhook = discord_webhook
         self.feed_url = feed_url
         self.feed_token = feed_token or ""
         self.event_log = event_log
-
-    def send_discord(self, message):
-        send_to_discord(message, self.discord_webhook)
-
-    def send_feed(self, message, line_type="transcript"):
-        send_to_feed(message, self.feed_url, self.feed_token, line_type)
+        self.manager = manager
 
     def emit(self, event):
-        """Record a structured event, then publish it (see events.py).
+        """Record a structured event. Delivery is somebody else's problem.
 
-        The log append comes first and is the only part that must not fail: once
-        the event is durable, a send that dies can be retried from the cursor.
-        The inline sends below are still synchronous and still swallow their
-        errors — Phase 2 replaces them with workers reading the log, which is
-        what finally gets these blocking calls off the transcription path.
+        This runs on the transcription thread, so it must not block on a
+        network call — that coupling is what let a slow Discord webhook back up
+        the audio queue and cost transmissions that were never transcribed. An
+        append is a local sqlite write; the workers take it from there.
         """
         if self.event_log is not None:
             try:
                 self.event_log.append(event)
+                if self.manager is not None:
+                    self.manager.notify()
+                return
             except Exception as e:
-                print(f"[warn] event log append failed ({type(e).__name__}: {e})")
-        render = event["render"]
-        self.send_discord(render["discord"])
-        self.send_feed(render["plain"], events.legacy_line_type(event))
+                # Falling through to an inline send is worse than queueing, but
+                # better than dropping the event entirely.
+                print(f"[warn] event log append failed "
+                      f"({type(e).__name__}: {e}); sending inline")
+        self._send_inline(event)
+
+    def _send_inline(self, event):
+        if self.discord_webhook:
+            _post_inline(self.discord_webhook,
+                         {"content": event["render"]["discord"]},
+                         {"Content-Type": "application/json",
+                          "User-Agent": "ScannerFeed/1.0"})
+        if self.feed_url:
+            _post_inline(self.feed_url.rstrip("/") + "/ingest",
+                         {"line": event["render"]["plain"],
+                          "type": events.legacy_line_type(event)},
+                         {"Content-Type": "application/json",
+                          "Authorization": f"Bearer {self.feed_token}",
+                          "User-Agent": "ScannerFeed/1.0"})
 
 
 # ===================================================================
@@ -823,12 +823,22 @@ def main():
     else:
         print("[init] State store: disabled (in-memory change detection)")
 
-    # Groups are built before the store exists, so hand each one the log now.
-    # Without a store the outputs keep sending inline and nothing is recorded —
+    # Groups are built before the store exists, so hand each one the log now,
+    # and stand up a delivery worker per configured destination. Without a store
+    # there is nowhere to queue, so emit() falls back to blocking inline sends —
     # degraded, but the scanner still runs, which is the point of --no-store.
+    stop_event = threading.Event()
+    output_manager = None
     if store is not None:
-        for g in groups.values():
-            g["outputs"].event_log = store.events
+        output_manager = outputs.OutputManager(store.events, stop_event)
+        for group_name, g in groups.items():
+            out = g["outputs"]
+            out.event_log = store.events
+            out.manager = output_manager
+            output_manager.add_group(group_name,
+                                     discord_webhook=out.discord_webhook,
+                                     feed_url=out.feed_url,
+                                     feed_token=out.feed_token)
 
     if args.seed:
         seed_state(groups, store)
@@ -987,9 +997,12 @@ def main():
                     def make_wf_cb(o, gn):
                         def cb(event):
                             print(f"[{format_timestamp()}] [{gn}] {wf_fmt(event)}")
-                            if event["type"] != "wildfire_removed":
-                                o.emit(events.poller(gn, event, wf_fmt(event),
-                                                     wf_fmt_d(event)))
+                            # Everything is recorded, including wildfire_removed.
+                            # It was never announced and still is not — the
+                            # suppression moved into outputs.SUPPRESSED_TYPES, so
+                            # the log stays a complete record of what was seen.
+                            o.emit(events.poller(gn, event, wf_fmt(event),
+                                                 wf_fmt_d(event)))
 
                         return cb
 
@@ -1010,7 +1023,16 @@ def main():
 
     # --- Stream manager ---
     work_queue = queue.Queue(maxsize=20)
-    stop_event = threading.Event()
+
+    # Delivery workers. Started after the pollers so anything they emitted
+    # during startup is already in the log and goes out in the first pass.
+    if output_manager is not None:
+        output_manager.start()
+        if output_manager.workers:
+            names = ", ".join(w.cursor_name for w in output_manager.workers)
+            print(f"[init] Output workers: {names}")
+        else:
+            print("[init] Output workers: none configured")
 
     # --- Tone lookup reloader (per-stream) ---
     if stream_tone_detectors:
@@ -1175,6 +1197,14 @@ def main():
     # Shutdown
     def shutdown(sig=None, frame=None):
         print("\n[exit] Shutting down...")
+        # Let in-flight deliveries finish before the stop flag cuts them off.
+        # Whatever does not make it keeps its cursor unadvanced and goes out on
+        # the next start, so this is a courtesy, not correctness.
+        if output_manager is not None and output_manager.workers:
+            if not output_manager.drain(timeout=5.0):
+                behind = {name: n for name, n in output_manager.backlog().items() if n}
+                print(f"[exit] Output backlog carried to next start: {behind}")
+            output_manager.stop()
         stop_event.set()
         for p in all_pollers:
             try:
