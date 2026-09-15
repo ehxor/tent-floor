@@ -267,17 +267,27 @@ destination preserves ordering without coordination, and a stalled destination
 stalls only itself.
 
 Failures are split into the two kinds that call for different handling.
-A `RetryableFailure` — connection refused, timeout, 5xx, a 429 whose
-`Retry-After` is honoured, or a recoverable 4xx (401, 403, 408) — is retried
-with backoff indefinitely, because the whole point is to fall behind rather
-than lose data. A rotated feed token belongs in that set: classifying it
-permanent would discard every event from the outage window while someone fixes
-it. A `PermanentFailure` — any other 4xx, so a malformed payload or a deleted
-webhook — is logged loudly and skipped, because retrying it forever would wedge
-every event queued behind it.
+A `RetryableFailure` — connection refused, timeout, 5xx, or a 429 whose
+`Retry-After` is honoured — is retried with backoff indefinitely, because the
+whole point is to fall behind rather than lose data. A `PermanentFailure` — a
+malformed payload, a deleted webhook — is logged loudly and skipped, because
+retrying it forever would wedge every event queued behind it.
 
-Failure reporting is loud on the way down and on recovery, quiet in between,
-which is the opposite of the previous `except: pass`.
+The recoverable client errors (401, 403, 408) sit between the two. A rotated
+feed token is usually fixable, so discarding the stream the instant it happens
+would defeat the point of keeping a cursor — but "usually" is not "always", and
+an unbounded retry on a token that is genuinely dead wedges the destination on
+one event forever while `emit()` keeps appending behind it and the retention
+sweep quietly discards the backlog. So they are retried under a grace period
+(`CLIENT_ERROR_GRACE_S`, one hour of continuous client-error failure, reset by
+any successful delivery). Past it they are dropped like a permanent failure, so
+the cursor moves and recovery is immediate when the endpoint returns rather
+than needing a restart.
+
+Failure reporting is loud on the way down and on recovery, and re-warns every
+`FAILURE_REWARN_S` for as long as it keeps failing, with the pending count.
+Warning once and then retrying in silence is the same invisibility that hid the
+thread-death bug — it just hides a stuck thread instead of a dead one.
 
 A cursor that has never existed is not a cursor at 0. The log accumulates
 independently of which destinations exist, so a new output name starting at 0

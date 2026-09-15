@@ -376,6 +376,144 @@ class InlineFallback(unittest.TestCase):
         self.assertEqual(len(self.posted), 1)
 
 
+class ClientErrorGrace(WorkerBase):
+    """401/403 are retryable because a rotated token is usually fixable — but
+    "usually" is not "always", and an unbounded retry wedges the destination on
+    one event forever while emit() keeps appending behind it and the retention
+    sweep discards the backlog. After the grace, the cursor has to move again.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._grace = outputs.CLIENT_ERROR_GRACE_S
+
+    def tearDown(self):
+        outputs.CLIENT_ERROR_GRACE_S = self._grace
+        super().tearDown()
+
+    def bounded(self, message="HTTP 401 Unauthorized"):
+        return outputs.RetryableFailure(message, bounded=True)
+
+    def test_within_the_grace_the_event_is_retried_not_dropped(self):
+        outputs.CLIENT_ERROR_GRACE_S = 3600
+        self.existing_cursor()
+        self.log.append(transcript("queued"))
+        dest = FakeDestination(fail_times=10_000, error=self.bounded())
+        worker = self.run_worker(dest, until=lambda: dest.attempts >= 3, timeout=5.0)
+        self.assertEqual(self.log.cursor("vancouver-island:fake"), 0,
+                         "inside the grace the event stays queued")
+        self.assertEqual(worker.skipped, 0)
+
+    def test_past_the_grace_the_stream_flows_again(self):
+        outputs.CLIENT_ERROR_GRACE_S = 0   # grace already expired
+        self.existing_cursor()
+        for i in range(3):
+            self.log.append(transcript(f"line {i}"))
+        dest = FakeDestination(fail_times=10_000, error=self.bounded())
+        worker = self.run_worker(
+            dest, until=lambda: self.log.cursor("vancouver-island:fake") == 3,
+            timeout=5.0)
+        self.assertEqual(self.log.cursor("vancouver-island:fake"), 3,
+                         "a permanently dead endpoint must not wedge the cursor")
+        self.assertEqual(worker.skipped, 3)
+
+    def test_a_success_resets_the_grace_clock(self):
+        outputs.CLIENT_ERROR_GRACE_S = 3600
+        self.existing_cursor()
+        self.log.append(transcript("first"))
+        dest = FakeDestination(fail_times=2, error=self.bounded())
+        worker = self.run_worker(dest, until=lambda: len(dest.received) == 1,
+                                 timeout=5.0)
+        self.assertIsNone(worker.client_error_since,
+                          "a delivery that lands clears the failing run")
+        self.assertEqual(worker.skipped, 0)
+
+    def test_rate_limiting_is_never_bounded(self):
+        """429 means 'slow down', not 'your credentials are wrong'. Dropping
+        events after an hour of heavy traffic would be the wrong response."""
+        import urllib.error
+        err = urllib.error.HTTPError(
+            "http://x", 429, "Too Many Requests", {"Retry-After": "1"}, None)
+        with self.assertRaises(outputs.RetryableFailure) as caught:
+            outputs._raise_for_http_error(err)
+        self.assertFalse(caught.exception.bounded)
+
+    def test_server_errors_are_never_bounded(self):
+        import urllib.error
+        err = urllib.error.HTTPError("http://x", 503, "Unavailable", {}, None)
+        with self.assertRaises(outputs.RetryableFailure) as caught:
+            outputs._raise_for_http_error(err)
+        self.assertFalse(caught.exception.bounded)
+
+    def test_an_unbounded_failure_is_never_dropped_by_the_grace(self):
+        outputs.CLIENT_ERROR_GRACE_S = 0
+        self.existing_cursor()
+        self.log.append(transcript("kept"))
+        dest = FakeDestination(fail_times=10_000)   # plain retryable, unbounded
+        worker = self.run_worker(dest, until=lambda: dest.attempts >= 3, timeout=5.0)
+        self.assertEqual(self.log.cursor("vancouver-island:fake"), 0,
+                         "a network outage must still queue indefinitely")
+        self.assertEqual(worker.skipped, 0)
+
+    def test_auth_codes_are_marked_bounded(self):
+        import urllib.error
+        for code in (401, 403, 408):
+            err = urllib.error.HTTPError("http://x", code, "nope", {}, None)
+            with self.subTest(code=code):
+                with self.assertRaises(outputs.RetryableFailure) as caught:
+                    outputs._raise_for_http_error(err)
+                self.assertTrue(caught.exception.bounded)
+
+
+class FailureVisibility(WorkerBase):
+    """A worker that warns once and then retries in silence for a month is the
+    same invisibility that hid the thread-death bug — it just hides a stuck
+    thread instead of a dead one."""
+
+    def setUp(self):
+        super().setUp()
+        self._rewarn = outputs.FAILURE_REWARN_S
+
+    def tearDown(self):
+        outputs.FAILURE_REWARN_S = self._rewarn
+        super().tearDown()
+
+    def run_capturing(self, rewarn_s, attempts):
+        import contextlib, io
+        outputs.FAILURE_REWARN_S = rewarn_s
+        self.existing_cursor()
+        self.log.append(transcript("stuck"))
+        dest = FakeDestination(fail_times=10_000)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.run_worker(dest, until=lambda: dest.attempts >= attempts,
+                            timeout=5.0)
+        return [line for line in buffer.getvalue().splitlines() if "[warn]" in line]
+
+    def test_a_stuck_worker_keeps_reporting(self):
+        warnings = self.run_capturing(rewarn_s=0, attempts=5)
+        self.assertGreater(len(warnings), 1,
+                           "a destination stuck for a month must say so more "
+                           "than once at the start of it")
+
+    def test_it_does_not_warn_on_every_single_retry(self):
+        warnings = self.run_capturing(rewarn_s=3600, attempts=5)
+        self.assertEqual(len(warnings), 1,
+                         "loud on the way down, quiet while it stays down")
+
+    def test_the_warning_says_how_much_is_queued(self):
+        warnings = self.run_capturing(rewarn_s=0, attempts=3)
+        self.assertIn("pending", warnings[0])
+
+    def test_pending_counts_only_this_group(self):
+        self.existing_cursor()
+        self.log.append(transcript("mine", group="vancouver-island"))
+        self.log.append(transcript("theirs", group="interior"))
+        worker = outputs.OutputWorker(
+            self.log, FakeDestination(), "vancouver-island", self.stop)
+        self.assertEqual(worker.pending(), 1)
+
+
 class Classification(unittest.TestCase):
     """_post turns transport errors into the two kinds the worker acts on."""
 

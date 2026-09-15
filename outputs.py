@@ -46,6 +46,22 @@ BACKOFF_S = (1, 2, 5, 15, 30, 60)
 
 HTTP_TIMEOUT_S = 10
 
+# How long a destination may keep failing with a *client* error before its
+# events start being dropped rather than queued behind the failure.
+#
+# Retrying a rotated token is right — that is why 401/403 are retryable at all —
+# but the retry cannot be unbounded, or a token that is genuinely dead wedges
+# the destination on one event forever while emit() keeps appending behind it
+# and the retention sweep quietly discards the backlog. After the grace the
+# cursor moves again, so recovery is immediate when the endpoint comes back
+# instead of needing a restart.
+CLIENT_ERROR_GRACE_S = 3600
+
+# A worker that warns once and then retries in silence for a month is the same
+# invisibility that hid the thread-death bug; it just hides a stuck thread
+# instead of a dead one. Re-warn on this interval for as long as it is failing.
+FAILURE_REWARN_S = 300
+
 # wildfire.removed means a fire dropped out of the upstream feed. It is worth
 # recording — the log keeps it — but it was never announced to Discord or the
 # web feed, and making the log complete should not start announcing it.
@@ -53,25 +69,33 @@ SUPPRESSED_TYPES = frozenset({events.WILDFIRE_REMOVED})
 
 
 class PermanentFailure(Exception):
-    """This event will never be accepted: a bad token, a deleted webhook, a
-    malformed payload. Retrying blocks every event behind it, so the worker
-    logs it loudly and moves on."""
+    """This event will never be accepted: a malformed payload, a deleted
+    webhook. Retrying blocks every event behind it, so the worker logs it
+    loudly and moves on."""
 
 
 class RetryableFailure(Exception):
-    """The endpoint is unreachable or broken right now. Worth waiting for."""
+    """The endpoint is unreachable or broken right now. Worth waiting for.
 
-    def __init__(self, message, retry_after=None):
+    `bounded` marks the failures that are only *probably* temporary — a 401 or
+    403 that may be a rotation in progress or may be permanent. Those get the
+    grace period rather than unlimited patience.
+    """
+
+    def __init__(self, message, retry_after=None, bounded=False):
         super().__init__(message)
         self.retry_after = retry_after
+        self.bounded = bounded
 
 
-# 4xx codes worth waiting out rather than discarding the event. A rotated feed
-# token or a revoked permission (401/403) is fixable, and dropping the stream
-# while someone fixes it defeats the point of keeping a cursor; 408 is an
-# explicit ask to try again. Every other 4xx — a malformed payload, a deleted
-# webhook — will read the same after any amount of waiting.
-RETRYABLE_CLIENT_CODES = frozenset({401, 403, 408, 429})
+# 4xx codes worth waiting out rather than discarding the event immediately. A
+# rotated feed token or a revoked permission (401/403) is often fixable, and
+# dropping the stream the instant it happens defeats the point of keeping a
+# cursor; 408 is an explicit ask to try again. They are bounded by
+# CLIENT_ERROR_GRACE_S because "often fixable" is not "always". Every other 4xx
+# — a malformed payload, a deleted webhook — will read the same after any
+# amount of waiting.
+RETRYABLE_CLIENT_CODES = frozenset({401, 403, 408})
 
 
 def _raise_for_http_error(e):
@@ -92,7 +116,7 @@ def _raise_for_http_error(e):
                 retry_after = None
         raise RetryableFailure("rate limited (HTTP 429)", retry_after)
     if e.code in RETRYABLE_CLIENT_CODES:
-        raise RetryableFailure(f"HTTP {e.code} {e.reason}")
+        raise RetryableFailure(f"HTTP {e.code} {e.reason}", bounded=True)
     if 400 <= e.code < 500:
         raise PermanentFailure(f"HTTP {e.code} {e.reason}")
     raise RetryableFailure(f"HTTP {e.code} {e.reason}")
@@ -168,9 +192,25 @@ class OutputWorker(threading.Thread):
         self.delivered = 0
         self.skipped = 0
         self.consecutive_failures = 0
+        # When the current unbroken run of client errors began. None means the
+        # destination is not currently failing authentication.
+        self.client_error_since = None
+        self._last_warned_at = 0.0
 
     def notify(self):
         self.wake.set()
+
+    def _warn(self, message, force=False):
+        """Warn on the way down, then at intervals — never once and then never.
+
+        A destination stuck for a month should say so more than once at the
+        start of it, because nothing else is watching: status() is not polled
+        and backlog() only runs at shutdown.
+        """
+        now = time.monotonic()
+        if force or now - self._last_warned_at >= FAILURE_REWARN_S:
+            self._last_warned_at = now
+            print(f"[warn] [{self.cursor_name}] {message}")
 
     # -- delivery -----------------------------------------------------------
     def _deliver(self, event):
@@ -192,10 +232,28 @@ class OutputWorker(threading.Thread):
                 return True
             except RetryableFailure as e:
                 self.consecutive_failures += 1
-                # Loud on the way down, quiet while it stays down.
-                if self.consecutive_failures == 1:
-                    print(f"[warn] [{self.cursor_name}] delivery failing: {e} "
-                          f"(will retry; events are queued, not lost)")
+
+                if e.bounded:
+                    now = time.monotonic()
+                    if self.client_error_since is None:
+                        self.client_error_since = now
+                    elif now - self.client_error_since > CLIENT_ERROR_GRACE_S:
+                        # Long enough for a rotation to have been fixed. Treat
+                        # it as permanent from here so the cursor moves and the
+                        # stream flows, instead of holding one event forever
+                        # while the sweep discards everything behind it.
+                        stuck_for = (now - self.client_error_since) / 60
+                        print(f"[error] [{self.cursor_name}] dropping "
+                              f"{event['type']} {event['id']}: {e} "
+                              f"(failing for {stuck_for:.0f} min, past the "
+                              f"{CLIENT_ERROR_GRACE_S // 60} min grace)")
+                        self.skipped += 1
+                        return True
+
+                self._warn(f"delivery failing: {e} (will retry; "
+                           f"{self.consecutive_failures} consecutive failure(s), "
+                           f"{self.pending()} event(s) pending)",
+                           force=self.consecutive_failures == 1)
                 delay = e.retry_after
                 if delay is None:
                     delay = BACKOFF_S[min(attempt, len(BACKOFF_S) - 1)]
@@ -209,9 +267,10 @@ class OutputWorker(threading.Thread):
                 # these are usually config errors that a corrected restart
                 # resolves, and the alternative is discarding the event.
                 self.consecutive_failures += 1
-                if self.consecutive_failures == 1:
-                    print(f"[warn] [{self.cursor_name}] unexpected delivery error "
-                          f"({type(e).__name__}: {e}); will retry")
+                self._warn(f"unexpected delivery error "
+                           f"({type(e).__name__}: {e}); will retry "
+                           f"({self.consecutive_failures} consecutive)",
+                           force=self.consecutive_failures == 1)
                 self.stop_event.wait(BACKOFF_S[min(attempt, len(BACKOFF_S) - 1)])
                 attempt += 1
                 continue
@@ -220,6 +279,7 @@ class OutputWorker(threading.Thread):
                     print(f"[init] [{self.cursor_name}] delivery recovered after "
                           f"{self.consecutive_failures} failure(s)")
                 self.consecutive_failures = 0
+                self.client_error_since = None
                 self.delivered += 1
                 return True
         return False
@@ -261,9 +321,17 @@ class OutputWorker(threading.Thread):
                       f"({type(e).__name__}: {e}); continuing")
                 self.stop_event.wait(IDLE_POLL_S)
 
+    def pending(self):
+        """Events in this worker's group it has not acknowledged yet."""
+        try:
+            return max(0, self.log.latest_seq(group=self.group)
+                       - self.log.cursor(self.cursor_name))
+        except Exception:
+            return -1   # never let a status read break a delivery path
+
     def status(self):
         return (f"{self.cursor_name}: {self.delivered} delivered, "
-                f"{self.skipped} dropped, at seq {self.log.cursor(self.cursor_name)}"
+                f"{self.skipped} dropped, {self.pending()} pending"
                 + (f", FAILING ({self.consecutive_failures})"
                    if self.consecutive_failures else ""))
 

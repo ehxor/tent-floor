@@ -1209,6 +1209,8 @@ def main():
             if not output_manager.drain(timeout=5.0):
                 behind = {name: n for name, n in output_manager.backlog().items() if n}
                 print(f"[exit] Output backlog carried to next start: {behind}")
+            for worker in output_manager.workers:
+                print(f"[exit] {worker.status()}")
             output_manager.stop()
         stop_event.set()
         for p in all_pollers:
