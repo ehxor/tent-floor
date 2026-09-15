@@ -279,15 +279,23 @@ would defeat the point of keeping a cursor — but "usually" is not "always", an
 an unbounded retry on a token that is genuinely dead wedges the destination on
 one event forever while `emit()` keeps appending behind it and the retention
 sweep quietly discards the backlog. So they are retried under a grace period
-(`CLIENT_ERROR_GRACE_S`, one hour of continuous client-error failure, reset by
-any successful delivery). Past it they are dropped like a permanent failure, so
-the cursor moves and recovery is immediate when the endpoint returns rather
-than needing a restart.
+(`CLIENT_ERROR_GRACE_S`, one hour), and past it they are dropped like a
+permanent failure, so the cursor moves and recovery is immediate when the
+endpoint returns rather than needing a restart.
+
+The grace measures a *continuous run of client errors*: any successful
+delivery clears it, and so does any other kind of failure. A network outage in
+the middle is not evidence that the credentials are dead, and letting it
+accumulate would drop events for an auth blip that had only just started — the
+feed host unreachable for an hour, then returning 401 briefly during a
+rotation.
 
 Failure reporting is loud on the way down and on recovery, and re-warns every
 `FAILURE_REWARN_S` for as long as it keeps failing, with the pending count.
 Warning once and then retrying in silence is the same invisibility that hid the
-thread-death bug — it just hides a stuck thread instead of a dead one.
+thread-death bug — it just hides a stuck thread instead of a dead one. The
+throttle is checked before the message is built, because the pending count is a
+store query taking the same lock the transcription thread needs to append.
 
 A cursor that has never existed is not a cursor at 0. The log accumulates
 independently of which destinations exist, so a new output name starting at 0

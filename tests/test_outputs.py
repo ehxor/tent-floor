@@ -464,6 +464,74 @@ class ClientErrorGrace(WorkerBase):
                     outputs._raise_for_http_error(err)
                 self.assertTrue(caught.exception.bounded)
 
+    def test_an_unrelated_outage_does_not_count_toward_the_grace(self):
+        """The grace measures a continuous run of client errors. A network
+        outage in the middle is not evidence the credentials are dead, and
+        letting it accumulate drops events for an auth blip that had only just
+        started — e.g. the feed host is unreachable for an hour, comes back, and
+        returns 401 briefly during a token rotation."""
+        outputs.CLIENT_ERROR_GRACE_S = 0.5
+        self.existing_cursor()
+        self.log.append(transcript("survives"))
+
+        class Sequence:
+            kind = "fake"
+            def __init__(self): self.n = 0; self.received = []
+            def deliver(self, event):
+                self.n += 1
+                if self.n == 1:
+                    raise outputs.RetryableFailure("HTTP 401", bounded=True)
+                if self.n <= 100:      # unrelated outage, longer than the grace
+                    raise outputs.RetryableFailure("connection refused")
+                if self.n <= 110:      # auth again, well inside the grace
+                    raise outputs.RetryableFailure("HTTP 401", bounded=True)
+                self.received.append(event)
+
+        dest = Sequence()
+        worker = self.run_worker(dest, until=lambda: bool(dest.received),
+                                 timeout=8.0)
+        self.assertEqual(worker.skipped, 0,
+                         "the auth error was never continuous past the grace")
+        self.assertEqual(len(dest.received), 1)
+
+    def test_an_unexpected_error_also_clears_the_grace_clock(self):
+        """An unexpected exception is no more an auth failure than a 5xx is."""
+        outputs.CLIENT_ERROR_GRACE_S = 3600
+        self.existing_cursor()
+        self.log.append(transcript("x"))
+
+        class AuthThenSomethingElse:
+            kind = "fake"
+            def __init__(self): self.n = 0
+            def deliver(self, event):
+                self.n += 1
+                if self.n == 1:
+                    raise outputs.RetryableFailure("HTTP 401", bounded=True)
+                raise ValueError("unknown url type")
+
+        dest = AuthThenSomethingElse()
+        worker = self.run_worker(dest, until=lambda: dest.n >= 4, timeout=5.0)
+        self.assertIsNone(worker.client_error_since)
+
+    def test_a_non_bounded_failure_restarts_the_clock(self):
+        outputs.CLIENT_ERROR_GRACE_S = 3600
+        self.existing_cursor()
+        self.log.append(transcript("x"))
+
+        class AuthThenOutage:
+            kind = "fake"
+            def __init__(self): self.n = 0
+            def deliver(self, event):
+                self.n += 1
+                if self.n == 1:
+                    raise outputs.RetryableFailure("HTTP 401", bounded=True)
+                raise outputs.RetryableFailure("connection refused")
+
+        dest = AuthThenOutage()
+        worker = self.run_worker(dest, until=lambda: dest.n >= 4, timeout=5.0)
+        self.assertIsNone(worker.client_error_since,
+                          "a non-client failure clears the client-error run")
+
 
 class FailureVisibility(WorkerBase):
     """A worker that warns once and then retries in silence for a month is the
@@ -512,6 +580,31 @@ class FailureVisibility(WorkerBase):
         worker = outputs.OutputWorker(
             self.log, FakeDestination(), "vancouver-island", self.stop)
         self.assertEqual(worker.pending(), 1)
+
+    def test_a_throttled_warning_does_not_query_the_store(self):
+        """The throttle has to be checked before the message is built. A
+        pending() count interpolated into an argument is evaluated on every
+        retry even when the warning is discarded — and that query takes the same
+        lock the transcription thread needs in order to append."""
+        outputs.FAILURE_REWARN_S = 3600     # everything after the first is thrown away
+        self.existing_cursor()
+        self.log.append(transcript("stuck"))
+
+        calls = []
+        real = type(self.log).latest_seq
+        type(self.log).latest_seq = lambda s, group=None: (
+            calls.append(1), real(s, group=group))[1]
+        try:
+            dest = FakeDestination(fail_times=10_000)
+            self.run_worker(dest, until=lambda: dest.attempts >= 20, timeout=5.0)
+        finally:
+            type(self.log).latest_seq = real
+
+        self.assertGreaterEqual(dest.attempts, 20)
+        self.assertLess(len(calls), 10,
+                        f"{len(calls)} store reads for one printed warning across "
+                        f"{dest.attempts} retries — the throttle is saving the "
+                        f"print but not the query")
 
 
 class Classification(unittest.TestCase):

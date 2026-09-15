@@ -200,17 +200,20 @@ class OutputWorker(threading.Thread):
     def notify(self):
         self.wake.set()
 
-    def _warn(self, message, force=False):
-        """Warn on the way down, then at intervals — never once and then never.
+    def _should_warn(self, force=False):
+        """Whether to emit a failure warning now, and record that we did.
 
-        A destination stuck for a month should say so more than once at the
-        start of it, because nothing else is watching: status() is not polled
-        and backlog() only runs at shutdown.
+        Separate from formatting on purpose: the caller builds the message only
+        when this returns True. Interpolating a pending() count into an argument
+        would query the store on every retry even when the warning is thrown
+        away, and that query takes the same lock the transcription thread needs
+        in order to append.
         """
         now = time.monotonic()
         if force or now - self._last_warned_at >= FAILURE_REWARN_S:
             self._last_warned_at = now
-            print(f"[warn] [{self.cursor_name}] {message}")
+            return True
+        return False
 
     # -- delivery -----------------------------------------------------------
     def _deliver(self, event):
@@ -249,11 +252,17 @@ class OutputWorker(threading.Thread):
                               f"{CLIENT_ERROR_GRACE_S // 60} min grace)")
                         self.skipped += 1
                         return True
+                else:
+                    # The grace measures a *continuous run of client errors*. A
+                    # network outage in the middle is not evidence that the
+                    # credentials are dead, and letting it accumulate would drop
+                    # events for an auth blip that had only just started.
+                    self.client_error_since = None
 
-                self._warn(f"delivery failing: {e} (will retry; "
-                           f"{self.consecutive_failures} consecutive failure(s), "
-                           f"{self.pending()} event(s) pending)",
-                           force=self.consecutive_failures == 1)
+                if self._should_warn(force=self.consecutive_failures == 1):
+                    print(f"[warn] [{self.cursor_name}] delivery failing: {e} "
+                          f"(will retry; {self.consecutive_failures} consecutive "
+                          f"failure(s), {self.pending()} event(s) pending)")
                 delay = e.retry_after
                 if delay is None:
                     delay = BACKOFF_S[min(attempt, len(BACKOFF_S) - 1)]
@@ -267,10 +276,11 @@ class OutputWorker(threading.Thread):
                 # these are usually config errors that a corrected restart
                 # resolves, and the alternative is discarding the event.
                 self.consecutive_failures += 1
-                self._warn(f"unexpected delivery error "
-                           f"({type(e).__name__}: {e}); will retry "
-                           f"({self.consecutive_failures} consecutive)",
-                           force=self.consecutive_failures == 1)
+                self.client_error_since = None   # not a client error either
+                if self._should_warn(force=self.consecutive_failures == 1):
+                    print(f"[warn] [{self.cursor_name}] unexpected delivery error "
+                          f"({type(e).__name__}: {e}); will retry "
+                          f"({self.consecutive_failures} consecutive)")
                 self.stop_event.wait(BACKOFF_S[min(attempt, len(BACKOFF_S) - 1)])
                 attempt += 1
                 continue
