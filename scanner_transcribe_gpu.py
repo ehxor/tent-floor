@@ -44,6 +44,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import events
+from store import DEFAULT_DB_PATH, DEFAULT_RETENTION_DAYS, Store
 
 # ---------------------------------------------------------------------------
 # Config — tweak these to taste
@@ -115,10 +116,12 @@ def send_to_feed(message, feed_url, feed_token, line_type="transcript"):
 
 class GroupOutputs:
     """Holds output destinations for a group."""
-    def __init__(self, discord_webhook=None, feed_url=None, feed_token=None):
+    def __init__(self, discord_webhook=None, feed_url=None, feed_token=None,
+                 event_log=None):
         self.discord_webhook = discord_webhook
         self.feed_url = feed_url
         self.feed_token = feed_token or ""
+        self.event_log = event_log
 
     def send_discord(self, message):
         send_to_discord(message, self.discord_webhook)
@@ -127,13 +130,19 @@ class GroupOutputs:
         send_to_feed(message, self.feed_url, self.feed_token, line_type)
 
     def emit(self, event):
-        """Publish a structured event (see events.py).
+        """Record a structured event, then publish it (see events.py).
 
-        Phase 0 renders it down to the strings the existing outputs already
-        take, so nothing downstream changes yet. Phase 2 replaces the body with
-        an append to the local event log, at which point these blocking sends
-        move off the transcription path and onto their own cursors.
+        The log append comes first and is the only part that must not fail: once
+        the event is durable, a send that dies can be retried from the cursor.
+        The inline sends below are still synchronous and still swallow their
+        errors — Phase 2 replaces them with workers reading the log, which is
+        what finally gets these blocking calls off the transcription path.
         """
+        if self.event_log is not None:
+            try:
+                self.event_log.append(event)
+            except Exception as e:
+                print(f"[warn] event log append failed ({type(e).__name__}: {e})")
         render = event["render"]
         self.send_discord(render["discord"])
         self.send_feed(render["plain"], events.legacy_line_type(event))
@@ -536,6 +545,7 @@ def load_config(config_path):
 
     Returns a dict with:
         whisper: {bin, model, model_path}
+        store: {path, retention_days, enabled}
         groups: {group_name: {outputs: GroupOutputs, streams: [...], pollers: [...]}}
         all_streams: [{name, url, jargon_prompt, tone_lookup_path, group}]
     """
@@ -548,6 +558,13 @@ def load_config(config_path):
         print(f"[config] Warning: ${{{name}}} is not set, expanded to empty string")
 
     whisper_cfg = raw.get("whisper", {})
+
+    store_cfg = raw.get("store", {})
+    store_cfg = {
+        "path": store_cfg.get("path", DEFAULT_DB_PATH),
+        "retention_days": store_cfg.get("retention_days", DEFAULT_RETENTION_DAYS),
+        "enabled": store_cfg.get("enabled", True),
+    }
 
     groups = {}
     all_streams = []
@@ -588,14 +605,121 @@ def load_config(config_path):
 
     return {
         "whisper": whisper_cfg,
+        "store": store_cfg,
         "groups": groups,
         "all_streams": all_streams,
     }
 
 
 # ===================================================================
+# Cutover seeding
+# ===================================================================
+def seed_state(groups, store):
+    """Populate an empty store from one poll of each source, announcing nothing.
+
+    Only needed once, at cutover. The pollers no longer suppress their first
+    poll — that suppression is what used to lose incidents that appeared during
+    downtime — so starting against an empty database would treat everything
+    currently active as new and announce all of it. Seeding first avoids that
+    one-off flood. Running it against an already-populated store is harmless.
+    """
+    if store is None:
+        print("[seed] No state store configured; nothing to seed")
+        return
+
+    for group_name, group in groups.items():
+        for poller_cfg in group["pollers"]:
+            ptype = poller_cfg["type"]
+            scope = f"{group_name}:{ptype}"
+            try:
+                if ptype == "pulsepoint":
+                    from pulsepoint_poller import IncidentTracker, fetch_incidents
+                    active, _ = fetch_incidents(poller_cfg["agency"])
+                    if active is None:
+                        print(f"[seed] [{group_name}] pulsepoint: no data returned")
+                        continue
+                    tracker = IncidentTracker(
+                        unit_prefixes=poller_cfg.get("unit_prefix"), store=store,
+                        scope=scope, agency=poller_cfg["agency"])
+                    count = len(tracker.update(active))
+
+                elif ptype == "nanaimo_fire":
+                    from nanaimo_fire_poller import NanaimoFireTracker, fetch_incidents
+                    features = fetch_incidents()
+                    if features is None:
+                        print(f"[seed] [{group_name}] nanaimo_fire: no data returned")
+                        continue
+                    count = len(NanaimoFireTracker(store=store, scope=scope)
+                                .update(features))
+
+                elif ptype == "bc_wildfire":
+                    from bc_wildfire_poller import (BCWildfireTracker,
+                                                    fetch_incidents, parse_polygon)
+                    polygon_cfg = poller_cfg.get("polygon")
+                    polygon = parse_polygon(polygon_cfg) if polygon_cfg else None
+                    incidents = fetch_incidents(poller_cfg.get("fire_centre_code"))
+                    if incidents is None:
+                        print(f"[seed] [{group_name}] bc_wildfire: no data returned")
+                        continue
+                    count = len(BCWildfireTracker(polygon=polygon, store=store,
+                                                  scope=scope).update(incidents))
+                else:
+                    print(f"[seed] [{group_name}] Unknown poller type: {ptype}")
+                    continue
+
+                print(f"[seed] [{group_name}] {ptype}: absorbed {count} record(s)")
+            except Exception as e:
+                print(f"[seed] [{group_name}] {ptype} failed: {e}", file=sys.stderr)
+
+    print("[seed] Done. Start normally — only genuinely new activity is reported.")
+
+
+# ===================================================================
 # Main
 # ===================================================================
+def poller_scope(group_name, poller_cfg):
+    """A stable identity for one watcher, isolating its rows from every other.
+
+    Two watchers that share a scope read each other's rows as missing from their
+    own snapshot and flap between cleared and re-declared on every poll, forever.
+    What makes them different is their upstream filter, so the filter has to be
+    part of the scope: the shipped config polls PulsePoint agency EMS1201 twice
+    with different unit prefixes, and runs bc_wildfire against two fire centres.
+
+    Group and type alone would be enough for that config — both pairs happen to
+    sit in different groups — but only by luck, and the failure is silent.
+
+    The value is also a durable key, so it deliberately excludes anything that
+    is not part of the watcher's identity. Changing a filter does change it, and
+    that is correct: a different filter is a different view, and it should start
+    from its own state rather than inherit rows it never saw.
+    """
+    ptype = poller_cfg["type"]
+    parts = [group_name, ptype]
+    if ptype == "pulsepoint":
+        parts.append(str(poller_cfg.get("agency", "")))
+        prefixes = poller_cfg.get("unit_prefix") or []
+        parts.append("+".join(str(p) for p in prefixes))
+    elif ptype == "bc_wildfire":
+        parts.append(str(poller_cfg.get("fire_centre_code") or "all"))
+    return ":".join(parts)
+
+
+def check_scopes(groups):
+    """Refuse to start two watchers that would share a scope."""
+    seen = {}
+    for group_name, g in groups.items():
+        for poller_cfg in g["pollers"]:
+            scope = poller_scope(group_name, poller_cfg)
+            if scope in seen:
+                print(f"[error] Two pollers resolve to the same state scope "
+                      f"{scope!r}. They would read each other's incidents as "
+                      f"cleared and re-announce them on every poll. Give them "
+                      f"different filters or put them in different groups.")
+                sys.exit(1)
+            seen[scope] = True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Live-transcribe scanner audio streams using whisper.cpp")
@@ -610,6 +734,14 @@ def main():
     parser.add_argument("--no-tones", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--debug-vad", action="store_true")
+    parser.add_argument("--no-store", action="store_true",
+                        help="Disable durable state. Change detection falls back "
+                             "to memory, so a restart re-announces everything.")
+    parser.add_argument("--seed", action="store_true",
+                        help="Populate the state store from one poll of each "
+                             "source and exit, announcing nothing. Run this once "
+                             "at cutover so the first real start does not report "
+                             "every currently-active incident as new.")
     # Legacy single-output flags (used in single-stream mode)
     parser.add_argument("--discord-webhook")
     parser.add_argument("--feed-url")
@@ -644,6 +776,9 @@ def main():
                     "pollers": [],
                 }
             },
+            "store": {"path": DEFAULT_DB_PATH,
+                      "retention_days": DEFAULT_RETENTION_DAYS,
+                      "enabled": True},
             "all_streams": [{
                 "name": "Scanner",
                 "url": args.stream_url,
@@ -656,6 +791,48 @@ def main():
 
     all_streams = config["all_streams"]
     groups = config["groups"]
+
+    # --- State store ---
+    # Shared by every poller for change detection. Without it each poller falls
+    # back to in-memory state, which is what made restarts either replay every
+    # active incident or silently swallow whatever happened during downtime.
+    store_cfg = config["store"]
+    store = None
+    if store_cfg["enabled"] and not args.no_store:
+        check_scopes(groups)
+        try:
+            store = Store(store_cfg["path"],
+                          retention_days=store_cfg["retention_days"])
+            swept, events_swept, unconsumed = store.sweep()
+            detail = []
+            if swept:
+                detail.append(f"swept {swept} row(s)")
+            if events_swept:
+                detail.append(f"{events_swept} event(s)")
+            print(f"[init] State store: {store_cfg['path']} "
+                  f"(retention {store_cfg['retention_days']}d"
+                  + (", " + ", ".join(detail) if detail else "") + ")")
+            if unconsumed:
+                print(f"[warn] Retention dropped {unconsumed} event(s) that an "
+                      f"output had not consumed — check output cursors "
+                      f"({store.events.cursors()})")
+        except Exception as e:
+            print(f"[warn] State store unavailable ({e}); "
+                  f"falling back to in-memory change detection")
+            store = None
+    else:
+        print("[init] State store: disabled (in-memory change detection)")
+
+    # Groups are built before the store exists, so hand each one the log now.
+    # Without a store the outputs keep sending inline and nothing is recorded —
+    # degraded, but the scanner still runs, which is the point of --no-store.
+    if store is not None:
+        for g in groups.values():
+            g["outputs"].event_log = store.events
+
+    if args.seed:
+        seed_state(groups, store)
+        return
 
     if not all_streams:
         print("[error] No streams configured")
@@ -768,7 +945,9 @@ def main():
                         return cb
 
                     pp = PulsePointPoller(agency_id=agency, unit_prefixes=prefixes,
-                                          callback=make_pp_cb(out, group_name))
+                                          callback=make_pp_cb(out, group_name),
+                                          store=store,
+                                          scope=poller_scope(group_name, poller_cfg))
                     pp.start()
                     all_pollers.append(pp)
                     print(f"[init] [{group_name}] PulsePoint poller started (agency: {agency})")
@@ -787,7 +966,9 @@ def main():
                                                  nf_fmt_d(event)))
                         return cb
 
-                    nf = NanaimoFirePoller(callback=make_nf_cb(out, group_name))
+                    nf = NanaimoFirePoller(callback=make_nf_cb(out, group_name),
+                                           store=store,
+                                           scope=poller_scope(group_name, poller_cfg))
                     nf.start()
                     all_pollers.append(nf)
                     print(f"[init] [{group_name}] Nanaimo Fire poller started")
@@ -814,7 +995,9 @@ def main():
 
                     wf = BCWildfirePoller(polygon=polygon,
                                           fire_centre_code=fire_centre,
-                                          callback=make_wf_cb(out, group_name))
+                                          callback=make_wf_cb(out, group_name),
+                                          store=store,
+                                          scope=poller_scope(group_name, poller_cfg))
                     wf.start()
                     all_pollers.append(wf)
                     scope = f"{len(polygon)} point polygon" if polygon else "no polygon filter"

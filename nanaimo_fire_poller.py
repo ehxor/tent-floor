@@ -20,6 +20,8 @@ import threading
 import urllib.request
 from datetime import datetime
 
+from store import Store
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -48,31 +50,64 @@ def fetch_incidents():
 # Incident tracker
 # ---------------------------------------------------------------------------
 class NanaimoFireTracker:
-    """Track Nanaimo Fire incidents and emit events for new ones."""
+    """Track Nanaimo Fire incidents and emit events for new ones.
 
-    def __init__(self):
-        self.seen_ids = set()
+    This feed is a rolling window of recent incidents, so the only question
+    that matters is "have I announced this one already". Change detection is
+    delegated to store.Reconciler with no tracked columns — presence only —
+    so an incident whose units are updated mid-call does not re-announce.
+    """
+
+    def __init__(self, store=None, scope=""):
+        """
+        Args:
+            store: a store.Store. Defaults to an in-memory one, which gives
+                the pre-store behaviour of forgetting everything on exit.
+            scope: isolates this tracker's rows from other watchers sharing
+                the store.
+        """
+        self.store = store if store is not None else Store(":memory:")
+        self.recon = self.store.reconciler("nanaimo_incidents",
+                                           key=("incident_id",), scope=scope)
 
     def update(self, features):
         """Process features and return list of new incident events."""
         if features is None:
             return []
 
-        events = []
+        rows = []
+        by_id = {}
         for feature in features:
             props = feature.get("properties", {})
             incident_id = props.get("Id")
+            # Note `is None`, not falsiness: an Id of 0 is a real incident.
             if incident_id is None:
                 continue
 
-            if incident_id in self.seen_ids:
+            by_id[incident_id] = props
+            rows.append({
+                "incident_id": incident_id,
+                "call_type": props.get("Type", "Unknown"),
+                "location": props.get("Location", "Unknown"),
+                "apparatuses": props.get("Apparatuses", ""),
+                "timestamp": props.get("Timestamp", ""),
+                "time": props.get("Time", ""),
+                "date": props.get("Date", ""),
+                "raw": json.dumps(feature, sort_keys=True, default=str),
+            })
+
+        events = []
+        for change in self.recon.sync(rows):
+            # Only genuinely new incidents announce. 'reappeared' is ignored
+            # on purpose: an incident that drops out of the rolling window and
+            # comes back is the same incident, and the pre-store seen_ids set
+            # would never have announced it twice either.
+            if change.kind != "appeared":
                 continue
-
-            self.seen_ids.add(incident_id)
-
+            props = by_id[change.key[0]]
             events.append({
                 "type": "nanaimo_fire_incident",
-                "incident_id": incident_id,
+                "incident_id": change.key[0],
                 "call_type": props.get("Type", "Unknown"),
                 "location": props.get("Location", "Unknown"),
                 "apparatuses": props.get("Apparatuses", ""),
@@ -105,13 +140,20 @@ def format_event_discord(event):
 class NanaimoFirePoller:
     """Background thread that polls Nanaimo Fire API and calls a callback."""
 
-    def __init__(self, callback=None, poll_interval=POLL_INTERVAL_S):
-        self.tracker = NanaimoFireTracker()
+    def __init__(self, callback=None, poll_interval=POLL_INTERVAL_S, store=None,
+                 scope=""):
+        """
+        Args:
+            callback: function called with each event dict.
+            poll_interval: seconds between polls.
+            store: a store.Store for durable change detection. Without one,
+                state is in-memory and restarts forget what was announced.
+        """
+        self.tracker = NanaimoFireTracker(store=store, scope=scope)
         self.callback = callback
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
         self.thread = None
-        self._initial_load = True
 
     def start(self):
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
@@ -125,15 +167,10 @@ class NanaimoFirePoller:
             try:
                 features = fetch_incidents()
                 if features is not None:
-                    events = self.tracker.update(features)
-
-                    # On first load, silently absorb existing incidents
-                    # so we only notify on truly new ones
-                    if self._initial_load:
-                        self._initial_load = False
-                        continue
-
-                    for event in events:
+                    # No first-poll suppression: the store already knows what
+                    # was announced before this process started, so incidents
+                    # that arrived during downtime are no longer swallowed.
+                    for event in self.tracker.update(features):
                         if self.callback:
                             self.callback(event)
             except Exception as e:
