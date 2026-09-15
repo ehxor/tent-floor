@@ -217,20 +217,48 @@ invoking a formatting callback. That reshapes the poller signatures and the
 `store` config block PR #7 adds, which is why it is re-landed rather than merged
 and then immediately rewritten.
 
+One thing tightened on the way in. PR #7 scoped each reconciler by group and
+poller type, which is sufficient for the shipped config — but only because its
+two PulsePoint watchers and its two wildfire watchers happen to sit in different
+groups. Since what actually distinguishes two watchers is their upstream filter,
+the filter is now part of the scope (`poller_scope()`), and `check_scopes()`
+refuses to start a config where two watchers would collide. The store itself
+cannot make this check, because it never sees the filter.
+
+The scope is a durable key, so it deliberately excludes anything that is not
+part of a watcher's identity. Changing a filter does change the scope, and that
+is correct: a different filter is a different view, and it should start from its
+own state rather than inherit rows it never saw.
+
 ## Phases
 
 Phases 0–2 are internal. They change no external surface and can land while the
 tiering details are still settling.
 
-**Phase 0 — foundations.** RFC3339 UTC at every source. New `events.py` holding
-the envelope, typed constructors per event type, and a renderer that reproduces
-today's strings byte for byte. Emit sites build envelopes; outputs render from
-them.
+**Phase 0 — foundations.** *Landed.* RFC3339 UTC at every source. `events.py`
+holding the envelope, typed constructors per event type, and a renderer that
+reproduces today's strings byte for byte. Emit sites build envelopes; outputs
+render from them.
 
-**Phase 1 — durable spine.** PR #7's store, plus an `events` table (monotonic
-`seq`, ULID `id`, type, group, stream, tier, JSON payload) and an output cursor
-table. Pollers ported onto `Reconciler`. Fixes both the restart replay storm and
-the events-missed-during-downtime hole.
+**Phase 1 — durable spine.** *Landed.* PR #7's store, plus an `events` table
+(monotonic `seq`, ULID `id`, type, group, stream, tier, JSON payload) and an
+`output_cursors` table. Pollers ported onto `Reconciler`. Fixes both the restart
+replay storm and the events-missed-during-downtime hole.
+
+Two properties the log commits to, because consumers will lean on them:
+
+- **Append is idempotent on the envelope's ULID.** Replaying a batch returns the
+  original `seq` rather than writing a second copy, so a retried send or a
+  replayed fixture cannot duplicate.
+- **A cursor only moves forward.** `advance()` takes the max, so a late or
+  reordered acknowledgement cannot rewind an output and cause a re-send storm.
+  Delivery is at-least-once; the stable ULID is what lets the far side
+  de-duplicate.
+
+Retention sweeps the log by age, which is a hard bound — a stuck output does not
+get to grow the database without limit. But it reports how many unconsumed
+events it dropped, because silently discarding a dead output's backlog is how
+you find out about it six weeks later.
 
 **Phase 2 — decouple outputs.** Each output becomes a worker thread reading
 forward by cursor, with its own backoff and failure counter. The bare
