@@ -41,8 +41,9 @@ import base64
 import urllib.request
 import numpy as np
 from pathlib import Path
-from datetime import datetime
 from urllib.parse import urlparse
+
+import events
 
 # ---------------------------------------------------------------------------
 # Config — tweak these to taste
@@ -125,10 +126,17 @@ class GroupOutputs:
     def send_feed(self, message, line_type="transcript"):
         send_to_feed(message, self.feed_url, self.feed_token, line_type)
 
-    def send_all(self, plain_msg, discord_msg, line_type="transcript"):
-        """Send to both outputs. plain_msg for feed, discord_msg for Discord."""
-        self.send_discord(discord_msg)
-        self.send_feed(plain_msg, line_type)
+    def emit(self, event):
+        """Publish a structured event (see events.py).
+
+        Phase 0 renders it down to the strings the existing outputs already
+        take, so nothing downstream changes yet. Phase 2 replaces the body with
+        an append to the local event log, at which point these blocking sends
+        move off the transcription path and onto their own cursors.
+        """
+        render = event["render"]
+        self.send_discord(render["discord"])
+        self.send_feed(render["plain"], events.legacy_line_type(event))
 
 
 # ===================================================================
@@ -488,7 +496,8 @@ def find_model_file(model_name):
 
 
 def format_timestamp():
-    return datetime.now().strftime("%H:%M:%S")
+    """Wall-clock time for terminal output. Events carry UTC — see events.py."""
+    return events.local_clock()
 
 
 # ===================================================================
@@ -752,10 +761,10 @@ def main():
 
                     def make_pp_cb(o, gn):
                         def cb(event):
-                            ts = datetime.now().strftime("%H:%M:%S")
                             msg = format_event(event)
-                            print(f"[{ts}] [{gn}] {msg}")
-                            o.send_all(msg, format_event_discord(event), line_type="pulsepoint")
+                            print(f"[{format_timestamp()}] [{gn}] {msg}")
+                            o.emit(events.poller(gn, event, msg,
+                                                 format_event_discord(event)))
                         return cb
 
                     pp = PulsePointPoller(agency_id=agency, unit_prefixes=prefixes,
@@ -773,9 +782,9 @@ def main():
 
                     def make_nf_cb(o, gn):
                         def cb(event):
-                            ts = datetime.now().strftime("%H:%M:%S")
-                            print(f"[{ts}] [{gn}] {nf_fmt(event)}")
-                            o.send_all(nf_fmt(event), nf_fmt_d(event), line_type="nanaimo_fire")
+                            print(f"[{format_timestamp()}] [{gn}] {nf_fmt(event)}")
+                            o.emit(events.poller(gn, event, nf_fmt(event),
+                                                 nf_fmt_d(event)))
                         return cb
 
                     nf = NanaimoFirePoller(callback=make_nf_cb(out, group_name))
@@ -796,10 +805,10 @@ def main():
 
                     def make_wf_cb(o, gn):
                         def cb(event):
-                            ts = datetime.now().strftime("%H:%M:%S")
-                            print(f"[{ts}] [{gn}] {wf_fmt(event)}")
+                            print(f"[{format_timestamp()}] [{gn}] {wf_fmt(event)}")
                             if event["type"] != "wildfire_removed":
-                                o.send_all(wf_fmt(event), wf_fmt_d(event), line_type="bc_wildfire")
+                                o.emit(events.poller(gn, event, wf_fmt(event),
+                                                     wf_fmt_d(event)))
 
                         return cb
 
@@ -1047,12 +1056,9 @@ def main():
                 tone_events = det.feed_audio(audio_np, SAMPLE_RATE)
                 for event in tone_events:
                     unit = event["unit"] or "UNKNOWN (logged)"
-                    print(f"[{event['timestamp']}] {bold}{color}{stream_name}{reset} "
+                    print(f"[{format_timestamp()}] {bold}{color}{stream_name}{reset} "
                           f"*** PAGE: {event['key']} → {unit} ***")
-                    out.send_all(
-                        f"📟 {stream_name} PAGE: {event['key']} → {unit}",
-                        f"📟 **{stream_name}** PAGE: {event['key']} → {unit}",
-                        line_type="tone")
+                    out.emit(events.tone_page(group_name, stream_name, event))
 
             # Transcribe
             prompt = stream_jargon.get(stream_name)
@@ -1066,10 +1072,10 @@ def main():
             if text:
                 print(f"[{format_timestamp()}] {color}{stream_name}{reset} "
                       f"({duration:.1f}s audio, {elapsed:.1f}s) {text}")
-                out.send_all(
-                    f"📻 {stream_name} ({duration:.1f}s): {text}",
-                    f"📻 **{stream_name}** ({duration:.1f}s): {text}",
-                    line_type="transcript")
+                out.emit(events.transcript(group_name, stream_name, text,
+                                          duration_s=duration,
+                                          model=model_name,
+                                          latency_s=elapsed))
 
     except Exception as e:
         print(f"[error] {e}")

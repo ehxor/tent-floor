@@ -19,7 +19,8 @@ import sys
 import wave
 import numpy as np
 from pathlib import Path
-from datetime import datetime
+
+import events
 
 # ---------------------------------------------------------------------------
 # Standard two-tone paging frequencies (Hz)
@@ -300,7 +301,9 @@ class TwoToneDetector:
         """Create a tone detection event and log unknowns."""
         key = f"{self.tone_a_freq}/{self.tone_b_freq}"
         unit = self.lookup.get(key)
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        # UTC so the unknown-tone log stays orderable across days and the DST
+        # transition; the terminal renders its own local clock.
+        timestamp = events.utc_now()
 
         event = {
             "tone_a": self.tone_a_freq,
