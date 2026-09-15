@@ -185,8 +185,20 @@ def _migration_002(cur):
     """)
 
 
+def _migration_003(cur):
+    """Index the per-group read the output workers do.
+
+    Each worker reads `WHERE seq > ? AND group_name = ?`. With only the seq
+    primary key to go on, sqlite walks forward from the cursor and filters,
+    so a worker for a quiet group scans the whole tail of the log on every
+    pass and finds nothing. LIMIT bounds rows returned, not rows scanned, and
+    the scan holds the same lock the transcription thread needs to append.
+    """
+    cur.execute("CREATE INDEX events_group_seq ON events(group_name, seq)")
+
+
 # Ordered. Append only — never edit a migration that has shipped.
-MIGRATIONS = [_migration_001, _migration_002]
+MIGRATIONS = [_migration_001, _migration_002, _migration_003]
 
 # Tables the retention sweep applies to.
 RECONCILED_TABLES = ("pulsepoint_incidents", "pulsepoint_units",
@@ -518,12 +530,14 @@ class EventLog:
             self.store.conn.commit()
         return seq
 
-    def read_after(self, seq, limit=100, tiers=None):
+    def read_after(self, seq, limit=100, tiers=None, group=None):
         """Events with seq strictly greater than `seq`, oldest first.
 
         Returns (seq, envelope) pairs. `tiers` restricts to a set of tiers —
         the edge uses it to serve a public reader without loading sensitive
-        bodies it is only going to discard.
+        bodies it is only going to discard. `group` restricts to one group's
+        events, which is how each output worker sees only its own destination's
+        traffic while sharing a single log.
         """
         sql = "SELECT seq, body FROM events WHERE seq > ?"
         params = [seq]
@@ -531,15 +545,29 @@ class EventLog:
             tiers = list(tiers)
             sql += f" AND tier IN ({', '.join('?' * len(tiers))})"
             params.extend(tiers)
+        if group is not None:
+            sql += " AND group_name = ?"
+            params.append(group)
         sql += " ORDER BY seq LIMIT ?"
         params.append(limit)
         with self.store.lock:
             rows = self.store.conn.execute(sql, params).fetchall()
         return [(row["seq"], json.loads(row["body"])) for row in rows]
 
-    def latest_seq(self):
+    def latest_seq(self, group=None):
+        """The head of the log, optionally for one group.
+
+        A consumer that only reads one group must compare against that group's
+        head. Measuring it against the global head reports a worker as behind
+        whenever any *other* group has appended since, which never clears.
+        """
+        sql = "SELECT MAX(seq) FROM events"
+        params = []
+        if group is not None:
+            sql += " WHERE group_name = ?"
+            params.append(group)
         with self.store.lock:
-            row = self.store.conn.execute("SELECT MAX(seq) FROM events").fetchone()
+            row = self.store.conn.execute(sql, params).fetchone()
         return row[0] or 0
 
     def count(self):
@@ -553,6 +581,32 @@ class EventLog:
             row = self.store.conn.execute(
                 "SELECT seq FROM output_cursors WHERE output = ?", (output,)).fetchone()
         return row[0] if row else 0
+
+    def ensure_cursor(self, output, default_seq, now=None):
+        """Return `output`'s cursor, creating it at `default_seq` if absent.
+
+        A cursor that has never existed is not the same as a cursor at 0, and
+        cursor() cannot tell them apart. It matters because the log predates
+        any given output name — events have been appended since the log was
+        introduced, regardless of which destinations existed then. A brand new
+        destination starting at 0 would re-deliver everything still inside the
+        retention window, which for a Discord webhook means a month of backlog
+        in one burst.
+
+        So a new cursor starts at the head: it carries forward from now, and
+        backfilling is a deliberate act (pass a lower default_seq) rather than
+        the default.
+        """
+        now = time.time() if now is None else now
+        with self.store.lock:
+            cur = self.store.conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO output_cursors (output, seq, updated_at) "
+                "VALUES (?, ?, ?)", (output, default_seq, now))
+            self.store.conn.commit()
+            row = cur.execute("SELECT seq FROM output_cursors WHERE output = ?",
+                              (output,)).fetchone()
+        return row[0]
 
     def advance(self, output, seq, now=None):
         """Record that `output` has durably handled everything up to `seq`.

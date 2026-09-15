@@ -171,6 +171,21 @@ class Retention(unittest.TestCase):
 
 
 class Schema(unittest.TestCase):
+    def test_the_per_group_read_uses_an_index(self):
+        """Without one, a worker for a quiet group walks the whole tail of the
+        log on every pass — under the same lock the transcription thread needs
+        to append. LIMIT bounds rows returned, not rows scanned."""
+        store = Store(":memory:")
+        with store.lock:
+            plan = " ".join(
+                str(row[-1]) for row in store.conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT seq, body FROM events "
+                    "WHERE seq > ? AND group_name = ? ORDER BY seq LIMIT ?",
+                    (0, "g", 50)))
+        store.close()
+        self.assertIn("events_group_seq", plan,
+                      f"per-group read is not using the index: {plan}")
+
     def test_migrations_run_in_order_to_head(self):
         import store as store_module
         store = Store(":memory:")

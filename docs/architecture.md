@@ -260,9 +260,69 @@ get to grow the database without limit. But it reports how many unconsumed
 events it dropped, because silently discarding a dead output's backlog is how
 you find out about it six weeks later.
 
-**Phase 2 — decouple outputs.** Each output becomes a worker thread reading
-forward by cursor, with its own backoff and failure counter. The bare
-`except: pass` handlers go away, and the dropped-transmission path with them.
+**Phase 2 — decouple outputs.** *Landed.* Each destination is an
+`outputs.OutputWorker` thread reading forward from its own cursor
+(`<group>:<kind>`), so emitting is an append and nothing more. One thread per
+destination preserves ordering without coordination, and a stalled destination
+stalls only itself.
+
+Failures are split into the two kinds that call for different handling.
+A `RetryableFailure` — connection refused, timeout, 5xx, or a 429 whose
+`Retry-After` is honoured — is retried with backoff indefinitely, because the
+whole point is to fall behind rather than lose data. A `PermanentFailure` — a
+malformed payload, a deleted webhook — is logged loudly and skipped, because
+retrying it forever would wedge every event queued behind it.
+
+The recoverable client errors (401, 403, 408) sit between the two. A rotated
+feed token is usually fixable, so discarding the stream the instant it happens
+would defeat the point of keeping a cursor — but "usually" is not "always", and
+an unbounded retry on a token that is genuinely dead wedges the destination on
+one event forever while `emit()` keeps appending behind it and the retention
+sweep quietly discards the backlog. So they are retried under a grace period
+(`CLIENT_ERROR_GRACE_S`, one hour), and past it they are dropped like a
+permanent failure, so the cursor moves and recovery is immediate when the
+endpoint returns rather than needing a restart.
+
+The grace measures a *continuous run of client errors*: any successful
+delivery clears it, and so does any other kind of failure. A network outage in
+the middle is not evidence that the credentials are dead, and letting it
+accumulate would drop events for an auth blip that had only just started — the
+feed host unreachable for an hour, then returning 401 briefly during a
+rotation.
+
+Failure reporting is loud on the way down and on recovery, and re-warns every
+`FAILURE_REWARN_S` for as long as it keeps failing, with the pending count.
+Warning once and then retrying in silence is the same invisibility that hid the
+thread-death bug — it just hides a stuck thread instead of a dead one. The
+throttle is checked before the message is built, because the pending count is a
+store query taking the same lock the transcription thread needs to append.
+
+A cursor that has never existed is not a cursor at 0. The log accumulates
+independently of which destinations exist, so a new output name starting at 0
+would re-deliver everything inside the retention window — up to 30 days of
+transcripts into a Discord channel in one burst. `ensure_cursor()` seeds a new
+cursor at its group's current head; backfilling is a deliberate act rather than
+the default.
+
+The worker thread survives anything a destination throws. An exception the HTTP
+layer does not anticipate — a URL that lost its scheme raising `ValueError`, or
+an `http.client.HTTPException`, which is not an `OSError` — used to unwind the
+thread and leave that destination silently unserved for the life of the
+process, with nothing watching it.
+
+Backlog is measured against each group's own head. Against the global head it
+never reaches zero once a second group exists, so every shutdown burns the full
+drain timeout and then reports caught-up groups as behind; it also goes negative
+after a retention sweep, since cursors keep their seq while `MAX(seq)` drops.
+
+`wildfire.removed` is now recorded in the log and suppressed at the
+destinations (`outputs.SUPPRESSED_TYPES`) rather than never being emitted. The
+outward behaviour is unchanged; the log becomes a complete record of what was
+seen. The suppression applies on the inline fallback path too, or `--no-store`
+would start announcing it.
+
+Without a store there is nowhere to queue, so `--no-store` keeps the old
+blocking inline sends as an explicitly degraded path.
 
 **Phase 3 — audio clips.** Opus encoding, `clips` table, `audio` block in the
 envelope, 7 day local sweep, R2 for the served copy.
