@@ -11,6 +11,13 @@
         "enabled": true
     },
 
+    "audio": {
+        "enabled": true,
+        "dir": "clips",
+        "retention_days": 7,
+        "bitrate": "16k"
+    },
+
     "groups": {
         "vancouver-island": {
             "outputs": {

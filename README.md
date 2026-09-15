@@ -137,6 +137,10 @@ Create a `config.json` (see `config.json` in this repo for an example):
 | `store.path` | Sqlite file holding poller state (default: `tentfloor.db`) |
 | `store.retention_days` | How long to keep records after they leave a feed (default: `30`) |
 | `store.enabled` | Set `false` to fall back to in-memory change detection |
+| `audio.enabled` | Keep an Opus clip for each transcript (default: `true`) |
+| `audio.dir` | Where clips are written (default: `clips`) |
+| `audio.retention_days` | How long clips are kept (default: `7`) |
+| `audio.bitrate` | Opus bitrate (default: `16k`) |
 | `groups` | Named groups of streams + outputs |
 | `outputs.feed_url` | Cloudflare Worker URL for web feed |
 | `outputs.feed_token` | Bearer token for feed ingestion (use `${VAR}`, see [Secrets](#secrets)) |
@@ -156,6 +160,18 @@ Polls the BC Wildfire Service API every 10 minutes for active wildfires, filtere
 | `fire_centre_code` | No | Fire centre code to pre-filter the API query (e.g. `50` for Kamloops) |
 
 If `polygon` is set, only fires whose coordinates fall inside it are tracked. Use `--dump` in standalone mode to test your polygon against live data.
+
+## Audio Clips
+
+Each transcript keeps the audio it came from. whisper hallucinates — that is what `hallucinations.txt` exists to paper over — so a transcript on its own gives you no way to tell a clean transcription from an invented one. The clip is the ground truth, and the raw material for growing `jargon.txt`.
+
+Clips are encoded to Opus at `audio.bitrate` (default 16 kbps mono), which is transparent for dispatch voice and about 16× smaller than the WAV whisper already reads. That works out to roughly 2 kB per second of speech: a stream carrying an hour of actual transmissions per day costs about 50 MB across the 7 day retention, six hours a day about 300 MB.
+
+The clip is written *before* transcription, so a whisper timeout or crash cannot take the audio with it. A transmission that produces no transcript has its clip deleted again — nothing will ever reference it. Files are named by the sha256 of the audio, so identical audio is stored once.
+
+Clips expire faster than the events that mention them. An expired clip leaves the transcript intact with a dead reference; the text is the record, the audio is the short-lived evidence behind it.
+
+This needs **ffmpeg built with libopus** — the same ffmpeg already required for stream decoding, but check `ffmpeg -encoders | grep libopus` if clips do not appear. Without it the scanner logs a warning and runs with clips disabled rather than falling back to WAV, which would be 16× the disk for the same week. `--no-audio` or `audio.enabled: false` turns them off deliberately; `--no-store` disables them too, since the clip index lives in the state store.
 
 ## State Store
 

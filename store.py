@@ -197,8 +197,35 @@ def _migration_003(cur):
     cur.execute("CREATE INDEX events_group_seq ON events(group_name, seq)")
 
 
+def _migration_004(cur):
+    """Audio clips, on their own retention clock.
+
+    Clips are the largest and most sensitive thing stored, so they expire well
+    before the events that reference them. An expired clip leaves the transcript
+    intact with a dead reference, which is the intended shape: the text is the
+    record, the audio is the short-lived evidence behind it.
+
+    `id` is the sha256 of the PCM, so identical audio is stored once and a retry
+    cannot produce a second copy.
+    """
+    cur.execute("""
+        CREATE TABLE clips (
+            id          TEXT PRIMARY KEY,
+            path        TEXT NOT NULL,
+            group_name  TEXT,
+            stream      TEXT,
+            duration_s  REAL,
+            bytes       INTEGER,
+            codec       TEXT,
+            created_at  REAL NOT NULL,
+            expires_at  REAL NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX clips_expires_at ON clips(expires_at)")
+
+
 # Ordered. Append only — never edit a migration that has shipped.
-MIGRATIONS = [_migration_001, _migration_002, _migration_003]
+MIGRATIONS = [_migration_001, _migration_002, _migration_003, _migration_004]
 
 # Tables the retention sweep applies to.
 RECONCILED_TABLES = ("pulsepoint_incidents", "pulsepoint_units",

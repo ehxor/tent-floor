@@ -44,6 +44,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import events
+import clips
 import outputs
 from store import DEFAULT_DB_PATH, DEFAULT_RETENTION_DAYS, Store
 
@@ -571,6 +572,14 @@ def load_config(config_path):
         "enabled": store_cfg.get("enabled", True),
     }
 
+    audio_cfg = raw.get("audio", {})
+    audio_cfg = {
+        "enabled": audio_cfg.get("enabled", True),
+        "dir": audio_cfg.get("dir", clips.DEFAULT_DIR),
+        "retention_days": audio_cfg.get("retention_days", clips.DEFAULT_RETENTION_DAYS),
+        "bitrate": audio_cfg.get("bitrate", clips.DEFAULT_BITRATE),
+    }
+
     groups = {}
     all_streams = []
     color_idx = 0
@@ -611,6 +620,7 @@ def load_config(config_path):
     return {
         "whisper": whisper_cfg,
         "store": store_cfg,
+        "audio": audio_cfg,
         "groups": groups,
         "all_streams": all_streams,
     }
@@ -742,6 +752,8 @@ def main():
     parser.add_argument("--no-store", action="store_true",
                         help="Disable durable state. Change detection falls back "
                              "to memory, so a restart re-announces everything.")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="Do not keep audio clips for transcripts.")
     parser.add_argument("--seed", action="store_true",
                         help="Populate the state store from one poll of each "
                              "source and exit, announcing nothing. Run this once "
@@ -784,6 +796,10 @@ def main():
             "store": {"path": DEFAULT_DB_PATH,
                       "retention_days": DEFAULT_RETENTION_DAYS,
                       "enabled": True},
+            "audio": {"enabled": True,
+                      "dir": clips.DEFAULT_DIR,
+                      "retention_days": clips.DEFAULT_RETENTION_DAYS,
+                      "bitrate": clips.DEFAULT_BITRATE},
             "all_streams": [{
                 "name": "Scanner",
                 "url": args.stream_url,
@@ -825,6 +841,45 @@ def main():
             print(f"[warn] State store unavailable ({e}); "
                   f"falling back to in-memory change detection")
             store = None
+
+    # --- Audio clips ---
+    # A transcript of garbled radio is not verifiable without the audio it came
+    # from, and whisper hallucinates. Clips need the store for their index, so
+    # --no-store disables them too.
+    audio_cfg = config["audio"]
+    clip_store = None
+    if store is not None and audio_cfg["enabled"] and not args.no_audio:
+        ok, detail = clips.probe_encoder()
+        if not ok:
+            # Falling back to WAV would be ~60x the bytes for the same week of
+            # retention, so this stays off rather than quietly filling the disk.
+            print(f"[warn] Audio clips disabled: {detail}. Install ffmpeg with "
+                  f"libopus, or set audio.enabled=false to silence this.")
+        else:
+            try:
+                clip_store = clips.ClipStore(
+                    store,
+                    directory=audio_cfg["dir"],
+                    retention_days=audio_cfg["retention_days"],
+                    bitrate=audio_cfg["bitrate"],
+                    sample_rate=SAMPLE_RATE)
+                expired, orphans = clip_store.sweep()
+                count, total_bytes = clip_store.usage()
+                swept = []
+                if expired:
+                    swept.append(f"{expired} expired")
+                if orphans:
+                    swept.append(f"{orphans} orphaned")
+                print(f"[init] Audio clips: {audio_cfg['dir']} "
+                      f"({audio_cfg['bitrate']} opus, retention "
+                      f"{audio_cfg['retention_days']}d, {count} held, "
+                      f"{total_bytes / 1e6:.1f} MB"
+                      + (", swept " + " and ".join(swept) if swept else "") + ")")
+            except Exception as e:
+                print(f"[warn] Audio clips unavailable ({type(e).__name__}: {e})")
+                clip_store = None
+    elif args.no_audio or not audio_cfg["enabled"]:
+        print("[init] Audio clips: disabled")
     else:
         print("[init] State store: disabled (in-memory change detection)")
 
@@ -1280,7 +1335,14 @@ def main():
                           f"*** PAGE: {event['key']} → {unit} ***")
                     out.emit(events.tone_page(group_name, stream_name, event))
 
-            # Transcribe
+            # Transcribe. The clip is written first so a whisper timeout or
+            # crash cannot take the audio with it; if nothing transcribable
+            # comes back it is deleted again below.
+            clip = None
+            if clip_store is not None:
+                clip = clip_store.write(chunk_data, group_name, stream_name,
+                                        duration_s=duration)
+
             prompt = stream_jargon.get(stream_name)
             with transcribe_lock:
                 t0 = time.monotonic()
@@ -1295,7 +1357,13 @@ def main():
                 out.emit(events.transcript(group_name, stream_name, text,
                                           duration_s=duration,
                                           model=model_name,
-                                          latency_s=elapsed))
+                                          latency_s=elapsed,
+                                          audio=events.audio_ref(clip) if clip else None))
+            elif clip is not None:
+                # Silence, or a phrase the hallucination filter rejected. No
+                # event will ever reference this clip, so it is not worth a week
+                # of disk.
+                clip_store.delete(clip["id"])
 
     except Exception as e:
         print(f"[error] {e}")
