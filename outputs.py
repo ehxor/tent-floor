@@ -66,12 +66,19 @@ class RetryableFailure(Exception):
         self.retry_after = retry_after
 
 
+# 4xx codes worth waiting out rather than discarding the event. A rotated feed
+# token or a revoked permission (401/403) is fixable, and dropping the stream
+# while someone fixes it defeats the point of keeping a cursor; 408 is an
+# explicit ask to try again. Every other 4xx — a malformed payload, a deleted
+# webhook — will read the same after any amount of waiting.
+RETRYABLE_CLIENT_CODES = frozenset({401, 403, 408, 429})
+
+
 def _raise_for_http_error(e):
     """Turn an HTTPError into the one of two kinds the worker acts on.
 
     The split that matters is "wait and it will work" versus "this will never
-    work". A 401 from a rotated feed token or a 404 from a deleted webhook is
-    the second kind, and retrying it forever would block every event behind it.
+    work". Retrying the second kind forever would block every event behind it.
     """
     if e.code == 429:
         # Discord rate-limits webhooks. Honour the wait it asks for rather than
@@ -84,6 +91,8 @@ def _raise_for_http_error(e):
             except (TypeError, ValueError):
                 retry_after = None
         raise RetryableFailure("rate limited (HTTP 429)", retry_after)
+    if e.code in RETRYABLE_CLIENT_CODES:
+        raise RetryableFailure(f"HTTP {e.code} {e.reason}")
     if 400 <= e.code < 500:
         raise PermanentFailure(f"HTTP {e.code} {e.reason}")
     raise RetryableFailure(f"HTTP {e.code} {e.reason}")
@@ -193,6 +202,19 @@ class OutputWorker(threading.Thread):
                 self.stop_event.wait(delay)
                 attempt += 1
                 continue
+            except Exception as e:
+                # Anything _post did not anticipate: a URL that lost its scheme
+                # (ValueError), an http.client.HTTPException (not an OSError, so
+                # it escapes the handlers in _post). Treat it as retryable —
+                # these are usually config errors that a corrected restart
+                # resolves, and the alternative is discarding the event.
+                self.consecutive_failures += 1
+                if self.consecutive_failures == 1:
+                    print(f"[warn] [{self.cursor_name}] unexpected delivery error "
+                          f"({type(e).__name__}: {e}); will retry")
+                self.stop_event.wait(BACKOFF_S[min(attempt, len(BACKOFF_S) - 1)])
+                attempt += 1
+                continue
             else:
                 if self.consecutive_failures:
                     print(f"[init] [{self.cursor_name}] delivery recovered after "
@@ -204,32 +226,40 @@ class OutputWorker(threading.Thread):
 
     # -- loop ---------------------------------------------------------------
     def run(self):
-        cursor = self.log.cursor(self.cursor_name)
+        cursor = None
         while not self.stop_event.is_set():
             try:
+                if cursor is None:
+                    # Seed at this group's head, not 0. The log predates any
+                    # given destination name, so a fresh cursor at 0 would
+                    # re-deliver everything still inside the retention window.
+                    cursor = self.log.ensure_cursor(
+                        self.cursor_name, self.log.latest_seq(group=self.group))
+
                 batch = self.log.read_after(cursor, limit=BATCH, group=self.group)
+                if not batch:
+                    self.wake.wait(IDLE_POLL_S)
+                    self.wake.clear()
+                    continue
+
+                for seq, event in batch:
+                    if self.stop_event.is_set():
+                        return
+                    if event["type"] not in SUPPRESSED_TYPES:
+                        if not self._deliver(event):
+                            return  # stopping mid-retry; cursor stays put
+                    # Advance one at a time: a crash mid-batch re-sends at most
+                    # the event in flight, rather than replaying the batch.
+                    self.log.advance(self.cursor_name, seq)
+                    cursor = seq
             except Exception as e:
-                print(f"[warn] [{self.cursor_name}] log read failed "
-                      f"({type(e).__name__}: {e})")
+                # The thread must survive anything. Dying here leaves this
+                # destination silently dead for the life of the process, with
+                # nothing watching it — status() is never polled and backlog()
+                # only runs at shutdown.
+                print(f"[warn] [{self.cursor_name}] worker error "
+                      f"({type(e).__name__}: {e}); continuing")
                 self.stop_event.wait(IDLE_POLL_S)
-                continue
-
-            if not batch:
-                self.wake.wait(IDLE_POLL_S)
-                self.wake.clear()
-                continue
-
-            for seq, event in batch:
-                if self.stop_event.is_set():
-                    return
-                if event["type"] in SUPPRESSED_TYPES:
-                    pass  # recorded, deliberately not announced
-                elif not self._deliver(event):
-                    return  # stopping mid-retry; cursor stays put
-                # Advance one at a time: a crash mid-batch re-sends at most the
-                # event in flight, rather than replaying the whole batch.
-                self.log.advance(self.cursor_name, seq)
-                cursor = seq
 
     def status(self):
         return (f"{self.cursor_name}: {self.delivered} delivered, "
@@ -261,10 +291,15 @@ class OutputManager:
         for worker in self.workers:
             worker.start()
 
-    def notify(self):
-        """Nudge the workers that an append happened. Never blocks."""
+    def notify(self, group=None):
+        """Nudge workers that an append happened. Never blocks.
+
+        Scoped to one group by default, so a busy group's traffic does not wake
+        every other group's workers into a pointless read.
+        """
         for worker in self.workers:
-            worker.notify()
+            if group is None or worker.group == group:
+                worker.notify()
 
     def stop(self):
         """Signal shutdown and wake any idle worker so it notices now.
@@ -277,10 +312,19 @@ class OutputManager:
         self.notify()
 
     def backlog(self):
-        """How far each worker is behind the head of the log."""
-        head = self.log.latest_seq()
-        return {w.cursor_name: head - self.log.cursor(w.cursor_name)
-                for w in self.workers}
+        """How far each worker is behind the head of *its own group*.
+
+        Measuring against the global head would report a worker as behind
+        whenever any other group appended, which never clears — and would go
+        negative after a retention sweep, since cursors keep their seq while
+        MAX(seq) drops.
+        """
+        out = {}
+        for worker in self.workers:
+            head = self.log.latest_seq(group=worker.group)
+            out[worker.cursor_name] = max(
+                0, head - self.log.cursor(worker.cursor_name))
+        return out
 
     def drain(self, timeout=5.0):
         """Give the workers a moment to finish in-flight deliveries on exit.

@@ -267,20 +267,41 @@ destination preserves ordering without coordination, and a stalled destination
 stalls only itself.
 
 Failures are split into the two kinds that call for different handling.
-A `RetryableFailure` — connection refused, timeout, 5xx, or a 429 whose
-`Retry-After` is honoured — is retried with backoff indefinitely, because the
-whole point is to fall behind rather than lose data. A `PermanentFailure` —
-any other 4xx, so a rotated feed token or a deleted webhook — is logged loudly
-and skipped, because retrying it forever would wedge every event queued behind
-it.
+A `RetryableFailure` — connection refused, timeout, 5xx, a 429 whose
+`Retry-After` is honoured, or a recoverable 4xx (401, 403, 408) — is retried
+with backoff indefinitely, because the whole point is to fall behind rather
+than lose data. A rotated feed token belongs in that set: classifying it
+permanent would discard every event from the outage window while someone fixes
+it. A `PermanentFailure` — any other 4xx, so a malformed payload or a deleted
+webhook — is logged loudly and skipped, because retrying it forever would wedge
+every event queued behind it.
 
 Failure reporting is loud on the way down and on recovery, quiet in between,
 which is the opposite of the previous `except: pass`.
 
+A cursor that has never existed is not a cursor at 0. The log accumulates
+independently of which destinations exist, so a new output name starting at 0
+would re-deliver everything inside the retention window — up to 30 days of
+transcripts into a Discord channel in one burst. `ensure_cursor()` seeds a new
+cursor at its group's current head; backfilling is a deliberate act rather than
+the default.
+
+The worker thread survives anything a destination throws. An exception the HTTP
+layer does not anticipate — a URL that lost its scheme raising `ValueError`, or
+an `http.client.HTTPException`, which is not an `OSError` — used to unwind the
+thread and leave that destination silently unserved for the life of the
+process, with nothing watching it.
+
+Backlog is measured against each group's own head. Against the global head it
+never reaches zero once a second group exists, so every shutdown burns the full
+drain timeout and then reports caught-up groups as behind; it also goes negative
+after a retention sweep, since cursors keep their seq while `MAX(seq)` drops.
+
 `wildfire.removed` is now recorded in the log and suppressed at the
 destinations (`outputs.SUPPRESSED_TYPES`) rather than never being emitted. The
 outward behaviour is unchanged; the log becomes a complete record of what was
-seen.
+seen. The suppression applies on the inline fallback path too, or `--no-store`
+would start announcing it.
 
 Without a store there is nowhere to queue, so `--no-store` keeps the old
 blocking inline sends as an explicitly degraded path.

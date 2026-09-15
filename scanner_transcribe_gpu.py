@@ -124,7 +124,7 @@ class GroupOutputs:
             try:
                 self.event_log.append(event)
                 if self.manager is not None:
-                    self.manager.notify()
+                    self.manager.notify(event.get("group"))
                 return
             except Exception as e:
                 # Falling through to an inline send is worse than queueing, but
@@ -134,6 +134,11 @@ class GroupOutputs:
         self._send_inline(event)
 
     def _send_inline(self, event):
+        # The workers skip these; this path has to skip them too, or --no-store
+        # and a failed append would start announcing events that have never
+        # been announced.
+        if event["type"] in outputs.SUPPRESSED_TYPES:
+            return
         if self.discord_webhook:
             _post_inline(self.discord_webhook,
                          {"content": event["render"]["discord"]},
