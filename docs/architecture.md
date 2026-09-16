@@ -176,15 +176,42 @@ firehose is public.
 
 Clips are kept — a transcript of garbled radio is not verifiable without them,
 and they are the raw material for tuning `jargon.txt` and `hallucinations.txt`.
+whisper hallucinates, so a consumer reading a transcript has no way to tell a
+clean transcription from an invented one; the clip is the ground truth.
 
-- Encoded to Opus at ~16 kbps mono, which is transparent for voice and roughly
-  60× smaller than the WAV currently built for whisper.
+- Encoded to Opus at ~16 kbps mono, which is transparent for voice. Raw capture
+  is 16 kHz 16-bit mono (256 kbps), so a clip is about **16× smaller** than the
+  WAV already built for whisper — roughly 2 kB per second of speech. An hour of
+  actual transmissions a day costs about 50 MB per stream across the 7 day
+  retention; six hours a day, about 300 MB.
 - Written **before** transcription, so the clip survives a whisper timeout or
-  crash.
-- Content-addressed filenames, tracked in a `clips` table with an expiry.
+  crash. That guarantee hinges on the caller being able to tell "nothing was
+  said" from "whisper failed": `transcribe_chunk` returns `""` for the first
+  and `None` for the second, and only the first deletes the clip. A wedged GPU,
+  an OOM or a blown 60s budget leaves the audio on disk for the retention
+  window — it is exactly the audio worth hearing.
+- Content-addressed on the sha256 of the PCM, so identical audio is stored once
+  and a retry cannot produce a second copy. Two-level directory fan-out, since
+  a week of a busy scanner is a lot of files for one directory. A write that
+  matches stored audio is flagged `reused` and extends the expiry, so the
+  second transcript does not advertise the first one's deadline — and a reused
+  clip is never deleted, because an earlier event still references it.
+- Tracked in a `clips` table on its own retention clock, shorter than the log's.
+  The events outlive the clips: an expired clip leaves the transcript intact
+  with a dead reference, which is the intended shape rather than a bug.
+- Swept **hourly**, not only at startup. The scanner is built to stay up for
+  months — it restarts ffmpeg subprocesses, not the process — so a startup-only
+  sweep is close to never, and clips would grow without bound against a
+  retention figure that says otherwise. The same thread sweeps the event log.
 - Referenced from the envelope as
-  `audio: { duration_s, url, expires_at }`; the URL is stripped for
-  unauthenticated consumers.
+  `audio: { id, codec, duration_s, bytes, expires_at, url }`. The local path is
+  deliberately absent — it is meaningless off the host and would leak the
+  filesystem layout to every subscriber. `url` stays `null` until there is
+  somewhere to serve clips from, and is stripped for unauthenticated consumers
+  once there is.
+- Requires ffmpeg with libopus. If it is missing, clips are disabled with a
+  message saying so rather than falling back to WAV, which would be 16× the
+  bytes for the same week of retention.
 
 ## Relationship to PR #7
 
@@ -324,8 +351,13 @@ would start announcing it.
 Without a store there is nowhere to queue, so `--no-store` keeps the old
 blocking inline sends as an explicitly degraded path.
 
-**Phase 3 — audio clips.** Opus encoding, `clips` table, `audio` block in the
-envelope, 7 day local sweep, R2 for the served copy.
+**Phase 3 — audio clips.** *Landed.* Opus encoding, `clips` table (migration
+004), `audio` block in the envelope, 7 day local sweep including orphan
+collection.
+
+Not yet done: there is nowhere to serve clips from, so `url` is always `null`.
+Wiring that up — R2 or otherwise — belongs with Phase 4, since the tier
+enforcement that decides who may see a clip lives at the edge.
 
 **Phase 4 — edge becomes a log.** A Durable Object replaces the KV ring buffer.
 The current `/ingest` does a read-modify-write against a single key

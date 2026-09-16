@@ -10,5 +10,8 @@ __pycache__/
 # Captured API snapshots for equivalence testing
 fixtures/
 
+# Audio clips kept for transcripts
+clips/
+
 # Unknown two-tone pages, appended at runtime for growing the lookup tables
 unknown_tones_*.log

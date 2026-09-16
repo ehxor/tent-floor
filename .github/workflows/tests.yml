@@ -16,6 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ffmpeg
+        # clips.py shells out to ffmpeg for Opus, and a fake encoder cannot
+        # prove that the real invocation produces a playable file at the
+        # expected size. With ffmpeg here, tests/test_clips.py runs a genuine
+        # encode instead of skipping it.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -encoders | grep libopus
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}

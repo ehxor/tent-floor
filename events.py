@@ -203,7 +203,7 @@ def legacy_line_type(event):
 # them changes what Discord and the web UI display.
 # ---------------------------------------------------------------------------
 def transcript(group, stream, text, duration_s, engine="whisper.cpp",
-               model=None, latency_s=None):
+               model=None, latency_s=None, audio=None):
     data = {
         "text": text,
         "duration_s": round(duration_s, 3),
@@ -213,11 +213,37 @@ def transcript(group, stream, text, duration_s, engine="whisper.cpp",
     if latency_s is not None:
         # Not part of the event's meaning — kept for spotting a GPU falling behind.
         data["latency_s"] = round(latency_s, 3)
+    if audio is not None:
+        data["audio"] = audio
     return envelope(
         TRANSCRIPT_FINAL, data, group, stream=stream, tier=TIER_SENSITIVE,
         render_plain=f"📻 {stream} ({duration_s:.1f}s): {text}",
         render_discord=f"📻 **{stream}** ({duration_s:.1f}s): {text}",
     )
+
+
+def audio_ref(clip, url=None):
+    """The `audio` block for a transcript, built from a clips.ClipStore record.
+
+    `url` stays None until there is somewhere to serve clips from. The field is
+    present from the start so consumers can code against its presence rather
+    than against a schema change later, and because an expired or unserved clip
+    is a normal state rather than a missing field.
+
+    The local path is deliberately not included: it is meaningless off this host
+    and would leak the filesystem layout to every subscriber. The id is the
+    sha256 of the audio, so it identifies the clip wherever it ends up.
+    """
+    return {
+        "id": clip["id"],
+        "codec": clip["codec"],
+        "duration_s": clip["duration_s"],
+        "bytes": clip["bytes"],
+        "expires_at": datetime.fromtimestamp(
+            clip["expires_at"], tz=timezone.utc).isoformat(
+                timespec="seconds").replace("+00:00", "Z"),
+        "url": url,
+    }
 
 
 def tone_page(group, stream, tone_event):
