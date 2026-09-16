@@ -167,9 +167,9 @@ Each transcript keeps the audio it came from. whisper hallucinates — that is w
 
 Clips are encoded to Opus at `audio.bitrate` (default 16 kbps mono), which is transparent for dispatch voice and about 16× smaller than the WAV whisper already reads. That works out to roughly 2 kB per second of speech: a stream carrying an hour of actual transmissions per day costs about 50 MB across the 7 day retention, six hours a day about 300 MB.
 
-The clip is written *before* transcription, so a whisper timeout or crash cannot take the audio with it. A transmission that produces no transcript has its clip deleted again — nothing will ever reference it. Files are named by the sha256 of the audio, so identical audio is stored once.
+The clip is written *before* transcription, so a whisper timeout or crash cannot take the audio with it — when whisper fails, the clip stays on disk for the retention window, which is exactly the audio you would want to hear. A transmission that simply had nothing transcribable has its clip deleted again; nothing will ever reference it. Files are named by the sha256 of the audio, so identical audio is stored once.
 
-Clips expire faster than the events that mention them. An expired clip leaves the transcript intact with a dead reference; the text is the record, the audio is the short-lived evidence behind it.
+Clips expire faster than the events that mention them. An expired clip leaves the transcript intact with a dead reference; the text is the record, the audio is the short-lived evidence behind it. Expiry and orphan collection run hourly as well as at startup — the scanner is built to stay up for months, so a startup-only sweep would never fire.
 
 This needs **ffmpeg built with libopus** — the same ffmpeg already required for stream decoding, but check `ffmpeg -encoders | grep libopus` if clips do not appear. Without it the scanner logs a warning and runs with clips disabled rather than falling back to WAV, which would be 16× the disk for the same week. `--no-audio` or `audio.enabled: false` turns them off deliberately; `--no-store` disables them too, since the clip index lives in the state store.
 

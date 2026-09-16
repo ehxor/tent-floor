@@ -253,6 +253,14 @@ def pcm_to_wav_bytes(audio_np):
 
 
 def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=BEAM_SIZE):
+    """Returns the transcript, "" when there was nothing transcribable, or None
+    when whisper itself failed.
+
+    The caller has to tell those last two apart: "nothing was said" means the
+    audio is not worth keeping, while "whisper crashed or hung" means it is
+    exactly the audio worth keeping. Collapsing both to "" deletes the clip in
+    the case the clip exists for.
+    """
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     try:
         tmp.write(wav_bytes)
@@ -264,7 +272,7 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             print(f"[debug] whisper failed (code {result.returncode}): {result.stderr.strip()}")
-            return ""
+            return None
         lines = []
         for line in result.stdout.splitlines():
             text = line.strip()
@@ -280,7 +288,7 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
         return " ".join(lines)
     except subprocess.TimeoutExpired:
         print(f"[debug] whisper timeout (>60s)")
-        return ""
+        return None
     finally:
         os.unlink(tmp.name)
 
@@ -735,6 +743,26 @@ def check_scopes(groups):
             seen[scope] = True
 
 
+def should_delete_clip(text, clip):
+    """Whether a clip should be removed after transcription.
+
+    `text` is what transcribe_chunk returned: a transcript, "" for nothing
+    transcribable, or None when whisper itself failed.
+
+    A clip is deleted only when this transmission created it and produced
+    nothing worth keeping. whisper failing is not that case — it is the case
+    the clip exists for.
+    """
+    if clip is None:
+        return False
+    if text:
+        return False            # emitted, with the clip attached
+    if text is None:
+        return False            # whisper crashed or timed out — keep the audio
+    # On a dedup hit an earlier transcript still references this clip.
+    return not clip.get("reused")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Live-transcribe scanner audio streams using whisper.cpp")
@@ -841,17 +869,28 @@ def main():
             print(f"[warn] State store unavailable ({e}); "
                   f"falling back to in-memory change detection")
             store = None
+    else:
+        print("[init] State store: disabled (in-memory change detection)")
 
     # --- Audio clips ---
     # A transcript of garbled radio is not verifiable without the audio it came
     # from, and whisper hallucinates. Clips need the store for their index, so
     # --no-store disables them too.
+    #
+    # Every branch reports itself. An operator running --no-store --no-audio has
+    # to learn both facts, not whichever one happens to be tested first.
     audio_cfg = config["audio"]
     clip_store = None
-    if store is not None and audio_cfg["enabled"] and not args.no_audio:
+    audio_wanted = audio_cfg["enabled"] and not args.no_audio
+    if not audio_wanted:
+        print("[init] Audio clips: disabled")
+    elif store is None:
+        print("[init] Audio clips: disabled (the clip index lives in the "
+              "state store)")
+    else:
         ok, detail = clips.probe_encoder()
         if not ok:
-            # Falling back to WAV would be ~60x the bytes for the same week of
+            # Falling back to WAV would be ~16x the bytes for the same week of
             # retention, so this stays off rather than quietly filling the disk.
             print(f"[warn] Audio clips disabled: {detail}. Install ffmpeg with "
                   f"libopus, or set audio.enabled=false to silence this.")
@@ -878,10 +917,6 @@ def main():
             except Exception as e:
                 print(f"[warn] Audio clips unavailable ({type(e).__name__}: {e})")
                 clip_store = None
-    elif args.no_audio or not audio_cfg["enabled"]:
-        print("[init] Audio clips: disabled")
-    else:
-        print("[init] State store: disabled (in-memory change detection)")
 
     # Groups are built before the store exists, so hand each one the log now,
     # and stand up a delivery worker per configured destination. Without a store
@@ -1128,6 +1163,48 @@ def main():
 
     threading.Thread(target=hallucinations_reloader, daemon=True).start()
 
+    # --- Retention ---
+    # Both sweeps used to run only at startup, which is close to never: the
+    # scanner is built to stay up for months, restarting ffmpeg subprocesses
+    # rather than the process. On a box that never restarts, no expires_at was
+    # ever evaluated and no orphan ever collected, so clips grew without bound
+    # at roughly 2 kB per second of speech per stream — against a README that
+    # sizes a disk for seven days.
+    MAINTENANCE_INTERVAL_S = 3600
+
+    def maintenance_loop():
+        while not stop_event.is_set():
+            stop_event.wait(MAINTENANCE_INTERVAL_S)
+            if stop_event.is_set():
+                break
+            if store is not None:
+                try:
+                    rows, events_removed, unconsumed = store.sweep()
+                    if rows or events_removed:
+                        print(f"[{format_timestamp()}] [retention] swept "
+                              f"{rows} row(s), {events_removed} event(s)")
+                    if unconsumed:
+                        print(f"[warn] [retention] dropped {unconsumed} event(s) "
+                              f"an output had not consumed "
+                              f"({store.events.cursors()})")
+                except Exception as e:
+                    print(f"[warn] [retention] store sweep failed "
+                          f"({type(e).__name__}: {e})")
+            if clip_store is not None:
+                try:
+                    expired, orphans = clip_store.sweep()
+                    if expired or orphans:
+                        count, total_bytes = clip_store.usage()
+                        print(f"[{format_timestamp()}] [retention] clips: "
+                              f"{expired} expired, {orphans} orphaned, "
+                              f"{count} held ({total_bytes / 1e6:.1f} MB)")
+                except Exception as e:
+                    print(f"[warn] [retention] clip sweep failed "
+                          f"({type(e).__name__}: {e})")
+
+    if store is not None or clip_store is not None:
+        threading.Thread(target=maintenance_loop, daemon=True).start()
+
     managed_streams = []
     managed_lock = threading.Lock()
 
@@ -1359,7 +1436,14 @@ def main():
                                           model=model_name,
                                           latency_s=elapsed,
                                           audio=events.audio_ref(clip) if clip else None))
-            elif clip is not None:
+            elif text is None and clip is not None:
+                # whisper crashed or timed out. This is precisely the audio
+                # worth keeping, so the clip stays and ages out normally — no
+                # event references it, but it is on disk for the retention
+                # window if someone wants to hear what the GPU choked on.
+                print(f"[{format_timestamp()}] {color}{stream_name}{reset} "
+                      f"transcription failed; kept clip {clip['id'][:12]}")
+            elif should_delete_clip(text, clip):
                 # Silence, or a phrase the hallucination filter rejected. No
                 # event will ever reference this clip, so it is not worth a week
                 # of disk.

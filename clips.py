@@ -86,6 +86,12 @@ class ClipStore:
     def __init__(self, store, directory=DEFAULT_DIR, retention_days=DEFAULT_RETENTION_DAYS,
                  bitrate=DEFAULT_BITRATE, sample_rate=16000, ffmpeg_bin="ffmpeg",
                  encoder=None):
+        if sample_rate not in SUPPORTED_RATES:
+            # Fail here rather than once per clip inside ffmpeg, where it would
+            # read as an encoder problem rather than a configuration one.
+            raise ValueError(
+                f"Opus does not support {sample_rate} Hz; "
+                f"choose one of {', '.join(str(r) for r in SUPPORTED_RATES)}")
         self.store = store
         self.dir = Path(directory)
         self.retention_days = retention_days
@@ -111,6 +117,12 @@ class ClipStore:
     def write(self, pcm_bytes, group, stream, duration_s, now=None):
         """Encode and record one clip. Returns its record, or None on failure.
 
+        The record carries a `reused` flag: True when this call matched audio
+        already stored. The caller has to respect it, because an earlier event
+        still references that clip — deleting it on the second transmission's
+        behalf would unlink a file the first transcript points at. `reused` is
+        a property of this call rather than of the clip, so it is not stored.
+
         Never raises: losing a clip is worse than losing a transcript, but
         losing both because the encoder broke is worst of all, so a failure here
         only costs the audio.
@@ -121,7 +133,22 @@ class ClipStore:
 
         existing = self.get(clip_id)
         if existing is not None and path.exists():
-            return existing   # identical audio, already stored
+            # Identical audio. Extend the expiry so the new transcript does not
+            # advertise an expires_at inherited from the first one, which could
+            # already be in the past.
+            expires_at = max(existing["expires_at"], now + self.retention_days * 86400)
+            try:
+                with self.store.lock:
+                    self.store.conn.execute(
+                        "UPDATE clips SET expires_at = ? WHERE id = ?",
+                        (expires_at, clip_id))
+                    self.store.conn.commit()
+                existing["expires_at"] = expires_at
+            except Exception as e:
+                print(f"[warn] [clips] could not extend expiry "
+                      f"({type(e).__name__}: {e})")
+            existing["reused"] = True
+            return existing
 
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,6 +190,7 @@ class ClipStore:
             # orphan rather than leaving it forever.
             print(f"[warn] [clips] could not record clip ({type(e).__name__}: {e})")
             return None
+        record["reused"] = False
         return record
 
     def get(self, clip_id):

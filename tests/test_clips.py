@@ -51,7 +51,10 @@ class Writing(ClipStoreBase):
         self.assertEqual(record["codec"], "opus")
         self.assertEqual(record["duration_s"], 4.2)
         self.assertGreater(record["bytes"], 0)
-        self.assertEqual(self.clips.get(record["id"]), record)
+        self.assertFalse(record["reused"], "this call created the clip")
+        # `reused` describes the call, not the clip, so it is not persisted.
+        stored = self.clips.get(record["id"])
+        self.assertEqual(stored, {k: v for k, v in record.items() if k != "reused"})
 
     def test_identical_audio_is_stored_once(self):
         first = self.clips.write(self.pcm(), "g", "s", 1.0)
@@ -88,6 +91,44 @@ class Writing(ClipStoreBase):
         record = self.clips.write(self.pcm(), "g", "s", 1.0)
         # A week of a busy scanner is a lot of files for one directory.
         self.assertEqual(Path(record["path"]).parent.name, record["id"][:2])
+
+
+class Dedup(ClipStoreBase):
+    """Dedup is load-bearing — the module promises a retry cannot produce a
+    second copy — so the caller has to be able to tell a reuse from a create.
+    Without that, a second transmission with no transcript deletes a file an
+    earlier transcript still references."""
+
+    def test_a_reused_clip_is_flagged(self):
+        first = self.clips.write(self.pcm(), "g", "s", 1.0)
+        second = self.clips.write(self.pcm(), "g", "s", 1.0)
+        self.assertFalse(first["reused"])
+        self.assertTrue(second["reused"])
+        self.assertEqual(first["id"], second["id"])
+
+    def test_a_reused_clip_does_not_advertise_a_stale_expiry(self):
+        now = time.time()
+        first = self.clips.write(self.pcm(), "g", "s", 1.0, now=now - 6 * 86400)
+        second = self.clips.write(self.pcm(), "g", "s", 1.0, now=now)
+        self.assertGreater(second["expires_at"], first["expires_at"],
+                           "the second transcript must not inherit an expiry "
+                           "that is nearly up")
+        self.assertEqual(self.clips.get(second["id"])["expires_at"],
+                         second["expires_at"],
+                         "and the extension must be persisted")
+
+    def test_the_extension_never_shortens_an_expiry(self):
+        now = time.time()
+        long_lived = clips.ClipStore(
+            self.store, directory=Path(self.tmp.name) / "c2",
+            retention_days=30, encoder=fake_encoder())
+        first = long_lived.write(self.pcm(), "g", "s", 1.0, now=now)
+        short = clips.ClipStore(
+            self.store, directory=Path(self.tmp.name) / "c2",
+            retention_days=1, encoder=fake_encoder())
+        second = short.write(self.pcm(), "g", "s", 1.0, now=now)
+        self.assertEqual(second["expires_at"], first["expires_at"],
+                         "a shorter retention must not cut an existing clip short")
 
 
 class Deleting(ClipStoreBase):
@@ -212,6 +253,19 @@ class EncoderCommand(unittest.TestCase):
         ok, detail = clips.probe_encoder("definitely-not-a-real-binary")
         self.assertFalse(ok)
         self.assertIn("not found", detail)
+
+    def test_an_unsupported_sample_rate_fails_at_construction(self):
+        """Opus takes only a few rates. Catching it here names it as a config
+        problem; catching it in ffmpeg makes it look like an encoder fault, once
+        per clip, forever."""
+        store = Store(":memory:")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as caught:
+                clips.ClipStore(store, directory=tmp, sample_rate=44100)
+            self.assertIn("44100", str(caught.exception))
+            # The capture rate is fine.
+            clips.ClipStore(store, directory=tmp, sample_rate=16000)
+        store.close()
 
 
 class RealEncoder(unittest.TestCase):

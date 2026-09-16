@@ -185,14 +185,24 @@ clean transcription from an invented one; the clip is the ground truth.
   actual transmissions a day costs about 50 MB per stream across the 7 day
   retention; six hours a day, about 300 MB.
 - Written **before** transcription, so the clip survives a whisper timeout or
-  crash. A transmission that produces no transcript has its clip deleted again
-  — no event will ever reference it, so it is not worth a week of disk.
+  crash. That guarantee hinges on the caller being able to tell "nothing was
+  said" from "whisper failed": `transcribe_chunk` returns `""` for the first
+  and `None` for the second, and only the first deletes the clip. A wedged GPU,
+  an OOM or a blown 60s budget leaves the audio on disk for the retention
+  window — it is exactly the audio worth hearing.
 - Content-addressed on the sha256 of the PCM, so identical audio is stored once
   and a retry cannot produce a second copy. Two-level directory fan-out, since
-  a week of a busy scanner is a lot of files for one directory.
+  a week of a busy scanner is a lot of files for one directory. A write that
+  matches stored audio is flagged `reused` and extends the expiry, so the
+  second transcript does not advertise the first one's deadline — and a reused
+  clip is never deleted, because an earlier event still references it.
 - Tracked in a `clips` table on its own retention clock, shorter than the log's.
   The events outlive the clips: an expired clip leaves the transcript intact
   with a dead reference, which is the intended shape rather than a bug.
+- Swept **hourly**, not only at startup. The scanner is built to stay up for
+  months — it restarts ffmpeg subprocesses, not the process — so a startup-only
+  sweep is close to never, and clips would grow without bound against a
+  retention figure that says otherwise. The same thread sweeps the event log.
 - Referenced from the envelope as
   `audio: { id, codec, duration_s, bytes, expires_at, url }`. The local path is
   deliberately absent — it is meaningless off the host and would leak the
