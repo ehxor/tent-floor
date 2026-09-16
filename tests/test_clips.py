@@ -214,5 +214,87 @@ class EncoderCommand(unittest.TestCase):
         self.assertIn("not found", detail)
 
 
+class RealEncoder(unittest.TestCase):
+    """The one thing a fake encoder cannot prove: that the ffmpeg invocation
+    actually produces a playable Opus file, at roughly the size the retention
+    figures assume.
+
+    Skipped where ffmpeg is absent, so this only really runs in CI — which is
+    the point of installing ffmpeg there.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        ok, detail = clips.probe_encoder()
+        if not ok:
+            raise unittest.SkipTest(f"no Opus encoder: {detail}")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(":memory:")
+        self.clips = clips.ClipStore(
+            self.store, directory=Path(self.tmp.name) / "clips", retention_days=7)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def speech_like_pcm(self, seconds):
+        """Not speech, but the right shape: 16 kHz signed 16-bit mono."""
+        import math
+        import struct
+        frames = []
+        for n in range(int(16000 * seconds)):
+            # A couple of formants' worth of tone so the encoder has structure
+            # to work with rather than pure noise, which Opus handles badly and
+            # would distort the size check.
+            value = (0.4 * math.sin(2 * math.pi * 220 * n / 16000)
+                     + 0.2 * math.sin(2 * math.pi * 880 * n / 16000))
+            frames.append(struct.pack("<h", int(value * 20000)))
+        return b"".join(frames)
+
+    def test_a_real_clip_is_a_playable_opus_file(self):
+        pcm = self.speech_like_pcm(3.0)
+        record = self.clips.write(pcm, "vancouver-island", "Mid Island", 3.0)
+        self.assertIsNotNone(record, "the real encoder should have succeeded")
+        path = Path(record["path"])
+        self.assertTrue(path.exists())
+        # Opus ships in an Ogg container; every such file starts with this.
+        self.assertEqual(path.read_bytes()[:4], b"OggS")
+        self.assertEqual(record["bytes"], path.stat().st_size)
+        self.assertGreater(record["bytes"], 0)
+
+    def test_the_size_matches_the_retention_arithmetic(self):
+        """The README and docs size a disk off ~2 kB per second of speech at
+        16 kbps. If that is wrong, the retention guidance is wrong."""
+        seconds = 5.0
+        pcm = self.speech_like_pcm(seconds)
+        record = self.clips.write(pcm, "g", "s", seconds)
+        expected = 16_000 / 8 * seconds          # 16 kbps -> bytes
+        ratio = record["bytes"] / expected
+        self.assertGreater(ratio, 0.4,
+                           f"{record['bytes']}B is far below the 16 kbps budget")
+        self.assertLess(ratio, 2.5,
+                        f"{record['bytes']}B is far above the 16 kbps budget")
+
+    def test_a_real_clip_is_much_smaller_than_the_pcm(self):
+        """The 16x claim in the docs, checked rather than asserted in prose."""
+        seconds = 5.0
+        pcm = self.speech_like_pcm(seconds)
+        record = self.clips.write(pcm, "g", "s", seconds)
+        self.assertGreater(len(pcm) / record["bytes"], 8,
+                           "Opus should be at least 8x smaller than raw PCM")
+
+    def test_a_real_encode_of_garbage_still_fails_cleanly(self):
+        """An odd number of bytes is not a whole s16le frame."""
+        record = self.clips.write(b"\x01", "g", "s", 0.0)
+        # ffmpeg may accept or reject this; either way nothing may be left
+        # half-recorded, and it must not raise.
+        if record is None:
+            self.assertEqual(list(Path(self.clips.dir).rglob("*.opus")), [])
+        else:
+            self.assertTrue(Path(record["path"]).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
