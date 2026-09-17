@@ -355,9 +355,16 @@ blocking inline sends as an explicitly degraded path.
 004), `audio` block in the envelope, 7 day local sweep including orphan
 collection.
 
-Not yet done: there is nowhere to serve clips from, so `url` is always `null`.
-Wiring that up — R2 or otherwise — belongs with Phase 4, since the tier
-enforcement that decides who may see a clip lives at the edge.
+Not yet done: there is nowhere *public* to serve clips from, so `url` is always
+`null` in the envelope. Wiring that up — R2 or otherwise — belongs with Phase 4,
+since the tier enforcement that decides who may see a clip lives at the edge.
+
+`admin_ui.py` is the local counterpart and deliberately not part of that: a
+read-only, localhost-by-default page for searching transcripts and playing their
+audio on the transcription machine. It is how a clip actually gets listened to
+today, and it is the reason keeping the audio is useful before there is any
+serving layer at all. It shares the store and the clips directory but nothing
+else — no tiering, no cursors, no public surface.
 
 **Phase 4 — edge becomes a log.** A Durable Object replaces the KV ring buffer.
 The current `/ingest` does a read-modify-write against a single key

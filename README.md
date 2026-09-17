@@ -12,6 +12,7 @@ Live transcription and monitoring of emergency radio scanner streams with two-to
 - **Multi-Stream Support**: Process multiple scanner streams simultaneously with group-based configuration
 - **Durable State**: Shared sqlite store so pollers survive restarts without replaying or dropping incidents
 - **Web Feed**: Cloudflare Workers-based live feed with auto-refresh UI
+- **Admin UI**: Local web page for searching transcripts and playing the matching audio
 - **Discord Integration**: Optional Discord webhook notifications
 
 ## Requirements
@@ -172,6 +173,51 @@ The clip is written *before* transcription, so a whisper timeout or crash cannot
 Clips expire faster than the events that mention them. An expired clip leaves the transcript intact with a dead reference; the text is the record, the audio is the short-lived evidence behind it. Expiry and orphan collection run hourly as well as at startup — the scanner is built to stay up for months, so a startup-only sweep would never fire.
 
 This needs **ffmpeg built with libopus** — the same ffmpeg already required for stream decoding, but check `ffmpeg -encoders | grep libopus` if clips do not appear. Without it the scanner logs a warning and runs with clips disabled rather than falling back to WAV, which would be 16× the disk for the same week. `--no-audio` or `audio.enabled: false` turns them off deliberately; `--no-store` disables them too, since the clip index lives in the state store.
+
+## Admin UI
+
+A local web page for searching transcripts and playing the audio behind them, so finding a call does not mean `sqlite3` and hand-written `json_extract` queries against sha256-named files.
+
+Run it on the transcription machine, alongside the scanner:
+
+```bash
+python admin_ui.py --db tentfloor.db --clips clips
+# http://127.0.0.1:8842
+```
+
+Type a phrase, filter by stream or date, and hit play on any result. Matches are highlighted, and a transcript whose clip has already expired says so rather than offering a play button that 404s.
+
+### Filtering hallucinations
+
+Each result carries a **"not speech — add to filter"** button. whisper invents phrases on silence, and reading the archive is where you notice them, so that is where it should be possible to add one to `hallucinations.txt`.
+
+The phrase is editable before it is added, and that matters: the scanner filters each *line* whisper emits, while a stored transcript is those lines joined with spaces. Adding a multi-line transcript verbatim would never match anything. Trim it to just the invented phrase.
+
+Additions are appended atomically and de-duplicated, and the scanner reloads the file every five minutes, so a new filter takes effect on its own.
+
+This is the only thing the admin UI writes — and it writes a text file, not the database. Pass `--read-only` to remove the button entirely and leave search and playback.
+
+### Safety
+
+This is an admin tool, not part of the public feed:
+
+- It opens the store **read-only**, so it cannot disturb the running scanner. Reads are safe alongside the scanner's writes because the store is in WAL mode.
+- It binds to **localhost** by default. Binding anywhere else refuses to start without `--token`, because it serves transcribed emergency radio and the audio behind it with no access control of its own. With a token, reach it as `http://host:8842/?token=…` — the page carries it into every request, including the audio element, which cannot send an `Authorization` header.
+- Clip ids from a URL are never used to build a filesystem path. The id must be sha256-shaped, the path comes from the database, and it is checked to be inside the clips directory before anything is served.
+- Writes require a custom request header and a same-origin `Origin`. A localhost server is reachable from any page the browser visits, and a plain `<form>` post cannot set a custom header.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--db` | `tentfloor.db` | State store to read |
+| `--clips` | `clips` | Clips directory |
+| `--hallucinations` | `hallucinations.txt` | Filter file the button appends to |
+| `--read-only` | off | Disable the button; search and playback only |
+| `--host` | `127.0.0.1` | Bind address; anything else needs `--token` |
+| `--port` | `8842` | Port |
+| `--token` | none | Require this bearer token |
+| `--verbose` | off | Log every request |
+
+Playback needs a browser that handles Ogg Opus — Firefox and Chrome have for years; Safari only in recent versions. If a clip downloads instead of playing, that is the likely cause.
 
 ## State Store
 
