@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tent Floor — Archive</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e14;
+    --surface: #0f1319;
+    --surface-2: #141922;
+    --border: #1a1f2b;
+    --text: #c5cdd8;
+    --text-dim: #5c6674;
+    --accent: #4fc3f7;
+    --accent-dim: rgba(79, 195, 247, 0.12);
+    --warn: #ffb74d;
+    --mark: rgba(79, 195, 247, 0.28);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', system-ui, sans-serif;
+    min-height: 100vh;
+  }
+
+  .header {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+    backdrop-filter: blur(12px);
+  }
+
+  .header-row {
+    max-width: 1000px; margin: 0 auto;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+
+  h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+
+  .stats {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-dim);
+    margin-left: auto; white-space: nowrap;
+  }
+
+  .controls {
+    max-width: 1000px; margin: 12px auto 0;
+    display: flex; gap: 8px; flex-wrap: wrap;
+  }
+
+  input[type="search"], input[type="date"], select {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    padding: 9px 12px;
+    border-radius: 5px;
+  }
+  input[type="search"] { flex: 1; min-width: 220px; font-family: 'JetBrains Mono', monospace; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input[type="date"] { color-scheme: dark; font-size: 13px; }
+
+  .results {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 16px 24px 80px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+
+  .row {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 5px;
+    padding: 12px 14px;
+  }
+
+  .meta {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-dim);
+    margin-bottom: 7px;
+  }
+  .meta .stream { color: var(--accent); font-weight: 600; }
+
+  .text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13.5px; line-height: 1.6;
+    word-break: break-word;
+  }
+  mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 2px; }
+
+  audio { width: 100%; height: 34px; margin-top: 10px; display: block; }
+
+  .no-clip {
+    margin-top: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-dim);
+    font-style: italic;
+  }
+  .no-clip.expired { color: var(--warn); }
+
+  .empty, .loading {
+    text-align: center; color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px; padding: 60px 24px;
+  }
+
+  .more {
+    display: block; margin: 8px auto 0;
+    background: var(--surface-2); color: var(--accent);
+    border: 1px solid var(--border); border-radius: 5px;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    padding: 10px 20px; cursor: pointer;
+  }
+  .more:hover { border-color: var(--accent); }
+
+  @media (max-width: 600px) {
+    .header { padding: 12px 16px; }
+    .results { padding: 12px 16px 60px; }
+    .stats { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-row">
+    <h1>&#x1F4E1; Tent Floor Archive</h1>
+    <div class="stats" id="stats">&nbsp;</div>
+  </div>
+  <div class="controls">
+    <input type="search" id="q" placeholder="search transcripts…" autocomplete="off" autofocus>
+    <select id="stream"><option value="">all streams</option></select>
+    <input type="date" id="since" title="From (UTC)">
+    <input type="date" id="until" title="To (UTC)">
+  </div>
+</div>
+
+<div class="results" id="results">
+  <div class="loading">Loading…</div>
+</div>
+
+<script>
+const PAGE_SIZE = 50;
+
+// When the server was started with --token (required off localhost), reach it
+// as ?token=… and every request below carries it — including the <audio src>,
+// which cannot send an Authorization header.
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+function withToken(url) {
+  if (!TOKEN) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+}
+
+const el = {
+  q: document.getElementById('q'),
+  stream: document.getElementById('stream'),
+  since: document.getElementById('since'),
+  until: document.getElementById('until'),
+  results: document.getElementById('results'),
+  stats: document.getElementById('stats'),
+};
+
+let offset = 0;
+let inFlight = null;
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+
+// Highlight the query inside the transcript. Escaped first, so a transcript
+// containing markup cannot inject anything.
+function highlight(text, query) {
+  const safe = esc(text);
+  if (!query) return safe;
+  const pattern = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return safe.replace(new RegExp(pattern, 'gi'), m => '<mark>' + m + '</mark>');
+}
+
+function localTime(iso) {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString([], {
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  } catch { return iso; }
+}
+
+function params(extra = {}) {
+  const p = new URLSearchParams();
+  if (el.q.value.trim()) p.set('q', el.q.value.trim());
+  if (el.stream.value) p.set('stream', el.stream.value);
+  // The store holds RFC3339 UTC; a date input gives a bare day.
+  if (el.since.value) p.set('since', el.since.value + 'T00:00:00Z');
+  if (el.until.value) p.set('until', el.until.value + 'T23:59:59Z');
+  p.set('limit', String(PAGE_SIZE));
+  for (const [k, v] of Object.entries(extra)) p.set(k, String(v));
+  return p;
+}
+
+function rowHtml(r, query) {
+  const bits = [
+    '<div class="row">',
+    '<div class="meta">',
+    '<span class="stream">' + esc(r.stream || '—') + '</span>',
+    '<span>' + esc(localTime(r.ts)) + '</span>',
+  ];
+  if (r.duration_s != null) bits.push('<span>' + r.duration_s.toFixed(1) + 's</span>');
+  if (r.group_name) bits.push('<span>' + esc(r.group_name) + '</span>');
+  bits.push('</div>');
+  bits.push('<div class="text">' + highlight(r.text, query) + '</div>');
+
+  if (r.clip && !r.clip.expired) {
+    const kb = r.clip.bytes ? ' · ' + Math.round(r.clip.bytes / 1024) + ' kB' : '';
+    bits.push('<audio controls preload="none" src="' + esc(withToken('/api/clip/' + r.clip.id)) + '"></audio>');
+    bits.push('<div class="no-clip">' + esc(r.clip.id.slice(0, 12)) + kb + '</div>');
+  } else if (r.clip && r.clip.expired) {
+    bits.push('<div class="no-clip expired">audio expired — the transcript outlives its clip</div>');
+  } else {
+    bits.push('<div class="no-clip">no audio kept for this transcript</div>');
+  }
+  bits.push('</div>');
+  return bits.join('');
+}
+
+async function search(append = false) {
+  if (!append) offset = 0;
+  const query = el.q.value.trim();
+
+  if (inFlight) inFlight.abort();
+  const controller = new AbortController();
+  inFlight = controller;
+
+  if (!append) el.results.innerHTML = '<div class="loading">Searching…</div>';
+
+  try {
+    const resp = await fetch(withToken('/api/search?' + params({ offset })), { signal: controller.signal });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+
+    const html = data.results.map(r => rowHtml(r, query)).join('');
+    if (append) {
+      document.querySelector('.more')?.remove();
+      el.results.insertAdjacentHTML('beforeend', html);
+    } else if (data.results.length === 0) {
+      el.results.innerHTML = '<div class="empty">Nothing matched.</div>';
+      return;
+    } else {
+      el.results.innerHTML = html;
+    }
+
+    if (data.has_more) {
+      const button = document.createElement('button');
+      button.className = 'more';
+      button.textContent = 'Load more';
+      button.onclick = () => { offset += PAGE_SIZE; search(true); };
+      el.results.appendChild(button);
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    el.results.innerHTML = '<div class="empty">Search failed: ' + esc(e.message) + '</div>';
+  } finally {
+    if (inFlight === controller) inFlight = null;
+  }
+}
+
+let debounce;
+el.q.addEventListener('input', () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(() => search(false), 200);
+});
+for (const input of [el.stream, el.since, el.until]) {
+  input.addEventListener('change', () => search(false));
+}
+
+// Only one clip plays at a time — otherwise clicking down a list of results
+// stacks them on top of each other.
+el.results.addEventListener('play', e => {
+  for (const other of el.results.querySelectorAll('audio')) {
+    if (other !== e.target) other.pause();
+  }
+}, true);
+
+async function boot() {
+  try {
+    const [streams, stats] = await Promise.all([
+      fetch(withToken('/api/streams')).then(r => r.json()),
+      fetch(withToken('/api/stats')).then(r => r.json()),
+    ]);
+    for (const s of streams.streams) {
+      const option = document.createElement('option');
+      option.value = s.stream;
+      option.textContent = s.stream;
+      el.stream.appendChild(option);
+    }
+    el.stats.textContent =
+      stats.transcripts.toLocaleString() + ' transcripts · ' +
+      stats.clips.toLocaleString() + ' clips · ' +
+      (stats.clip_bytes / 1e6).toFixed(1) + ' MB';
+  } catch (e) {
+    el.stats.textContent = 'stats unavailable';
+  }
+  search(false);
+}
+
+boot();
+</script>
+</body>
+</html>
