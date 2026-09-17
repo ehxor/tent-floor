@@ -22,6 +22,7 @@ Requirements:
 
 import argparse
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -86,6 +87,66 @@ def parse_range(header, size):
     if start < 0 or start >= size or end < start:
         return None, None
     return start, min(end, size - 1)
+
+
+class Hallucinations:
+    """The scanner's hallucination filter, as an editable list.
+
+    whisper invents phrases on silence — "Thank you.", "Bye." — and the scanner
+    drops any output line that matches this file exactly. Finding one of those
+    is the main thing a person does while reading the archive, so the archive
+    is where it should be possible to add it.
+
+    One wrinkle worth knowing: the filter is applied to each *line* whisper
+    emits, while a stored transcript is those lines joined with spaces. Adding a
+    multi-line transcript verbatim would therefore never match anything, which
+    is why the UI lets the phrase be edited before it is added rather than
+    submitting the transcript blind.
+
+    The scanner reloads this file every five minutes, so an addition takes
+    effect on its own.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+
+    def phrases(self):
+        try:
+            return [line.strip() for line in
+                    self.path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def add(self, phrase):
+        """Append a phrase. Returns (added, count).
+
+        `added` is False when the phrase is already present — worth saying, so
+        the UI can report "already filtered" rather than claiming a change it
+        did not make.
+        """
+        phrase = (phrase or "").strip()
+        if not phrase:
+            raise ValueError("phrase is empty")
+        if "\n" in phrase or "\r" in phrase:
+            # One phrase per line is the whole format; a newline would silently
+            # add two entries, one of them probably nonsense.
+            raise ValueError("phrase must be a single line")
+
+        with self.lock:
+            existing = self.phrases()
+            if phrase in existing:
+                return False, len(existing)
+
+            updated = existing + [phrase]
+            # Write a sibling and rename, so a crash mid-write cannot leave the
+            # scanner reloading a truncated filter.
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text("\n".join(updated) + "\n", encoding="utf-8")
+            os.replace(tmp, self.path)
+            return True, len(updated)
 
 
 class Library:
@@ -243,7 +304,9 @@ class Handler(BaseHTTPRequestHandler):
     # which is what keep-alive requires to find the end of a body.
     protocol_version = "HTTP/1.1"
     library = None          # set on the server instance
+    hallucinations = None
     token = None
+    read_only = False
 
     # -- helpers ------------------------------------------------------------
     def _authorised(self):
@@ -293,6 +356,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"streams": self.library.streams()})
             elif route == "/api/stats":
                 self._send_json(self.library.stats())
+            elif route == "/api/hallucinations":
+                self._send_json({"count": len(self.hallucinations.phrases()),
+                                 "read_only": self.read_only})
             elif route.startswith("/api/clip/"):
                 self._serve_clip(route[len("/api/clip/"):])
             else:
@@ -302,6 +368,69 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"[error] {route}: {type(e).__name__}: {e}")
             self._send_error(500, f"{type(e).__name__}: {e}")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._authorised():
+            self._send_error(401, "token required")
+            return
+        if not self._same_origin():
+            # This listens on localhost, which every page the browser visits can
+            # reach. A form post cannot set a custom header, and a cross-origin
+            # fetch that sets one has to preflight -- which nothing here answers.
+            self._send_error(403, "cross-origin request refused")
+            return
+        try:
+            if parsed.path == "/api/hallucinations":
+                self._add_hallucination()
+            else:
+                self._send_error(404, "not found")
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            print(f"[error] POST {parsed.path}: {type(e).__name__}: {e}")
+            self._send_error(500, f"{type(e).__name__}: {e}")
+
+    def _same_origin(self):
+        if self.headers.get("X-Tent-Floor") != "1":
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            host = self.headers.get("Host", "")
+            if urllib.parse.urlparse(origin).netloc != host:
+                return False
+        return True
+
+    def _body(self, limit=64 * 1024):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return {}
+        if length <= 0 or length > limit:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _add_hallucination(self):
+        if self.read_only:
+            self._send_error(403, "server started with --read-only")
+            return
+        payload = self._body()
+        if not isinstance(payload, dict):
+            self._send_error(400, "expected a JSON object")
+            return
+        try:
+            added, count = self.hallucinations.add(payload.get("phrase"))
+        except ValueError as e:
+            self._send_error(400, str(e))
+            return
+        except OSError as e:
+            self._send_error(500, f"could not write the filter: {e}")
+            return
+        self._send_json({"added": added, "count": count,
+                         "phrase": (payload.get("phrase") or "").strip()})
 
     def _serve_page(self):
         try:
@@ -407,6 +536,11 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help=f"Bind address (default {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--hallucinations", default="hallucinations.txt",
+                        help="Filter file the 'not speech' button appends to")
+    parser.add_argument("--read-only", action="store_true",
+                        help="Disable the hallucination button; search and "
+                             "playback only")
     parser.add_argument("--token", help="Require this bearer token. Mandatory "
                                         "when binding off localhost.")
     parser.add_argument("--verbose", action="store_true", help="Log every request")
@@ -433,14 +567,23 @@ def main():
         sys.exit(1)
 
     stats = library.stats()
+    hallucinations = Hallucinations(args.hallucinations)
     Handler.library = library
+    Handler.hallucinations = hallucinations
     Handler.token = args.token
+    Handler.read_only = args.read_only
 
     server = AdminServer((args.host, args.port), Handler, verbose=args.verbose)
     print(f"[init] Tent Floor admin UI on http://{args.host}:{args.port}")
     print(f"[init] Store: {args.db} (read-only) · clips: {library.clips_dir}")
     print(f"[init] {stats['transcripts']} transcript(s), {stats['clips']} clip(s), "
           f"{stats['clip_bytes'] / 1e6:.1f} MB")
+    if args.read_only:
+        print("[init] Hallucination filter: read-only")
+    else:
+        print(f"[init] Hallucination filter: {hallucinations.path} "
+              f"({len(hallucinations.phrases())} phrases, reloaded by the "
+              f"scanner every 5 min)")
     if not local:
         print(f"[warn] Bound to {args.host} — reachable beyond this machine.")
     try:

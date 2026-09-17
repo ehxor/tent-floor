@@ -246,9 +246,14 @@ class RangeParsing(unittest.TestCase):
         self.assertEqual(admin_ui.parse_range("bytes=0-9,20-29", 100), (0, 9))
 
 
-class HttpServer(unittest.TestCase):
-    """A real server on an ephemeral port — byte ranges and status codes are
-    exactly what a mocked handler would hide."""
+class ServerFixture:
+    """Starts a real server on an ephemeral port.
+
+    Deliberately not a TestCase: subclassing one would re-run every inherited
+    test in each subclass, which is a slow way to test the same thing twice.
+    """
+
+    read_only = False
 
     @classmethod
     def setUpClass(cls):
@@ -258,8 +263,12 @@ class HttpServer(unittest.TestCase):
         cls.clips_dir = root / "clips"
         seed(cls.db, cls.clips_dir)
 
+        cls.filter_path = root / "hallucinations.txt"
+        cls.filter_path.write_text("Thank you.\nBye.\n", encoding="utf-8")
         admin_ui.Handler.library = admin_ui.Library(cls.db, cls.clips_dir)
+        admin_ui.Handler.hallucinations = admin_ui.Hallucinations(cls.filter_path)
         admin_ui.Handler.token = None
+        admin_ui.Handler.read_only = cls.read_only
         cls.server = admin_ui.AdminServer(("127.0.0.1", 0), admin_ui.Handler)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -271,6 +280,7 @@ class HttpServer(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join(timeout=5)
         admin_ui.Handler.library = None
+        admin_ui.Handler.hallucinations = None
         cls.tmp.cleanup()
 
     def get(self, path, headers=None):
@@ -286,7 +296,31 @@ class HttpServer(unittest.TestCase):
         _, _, body = self.get("/api/search?q=Bowen")
         return json.loads(body)["results"][0]["clip"]["id"]
 
-    # -- routes -------------------------------------------------------------
+    def post(self, path, payload, headers=None):
+        merged = {"Content-Type": "application/json", "X-Tent-Floor": "1"}
+        merged.update(headers or {})
+        # A None value means "send this request without that header", which is
+        # how the CSRF tests reproduce what a plain <form> post can do.
+        merged = {k: v for k, v in merged.items() if v is not None}
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=merged, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return e.code, json.loads(raw)
+            except ValueError:
+                return e.code, {}
+
+
+class Routes(ServerFixture, unittest.TestCase):
+    """Byte ranges, content types and status codes are exactly what a mocked
+    handler would hide, so this drives a live server."""
+
     def test_the_page_is_served(self):
         status, headers, body = self.get("/")
         self.assertEqual(status, 200)
@@ -379,6 +413,7 @@ class TokenAuth(unittest.TestCase):
         cls.db = root / "t.db"
         seed(cls.db, root / "clips")
         admin_ui.Handler.library = admin_ui.Library(cls.db, root / "clips")
+        admin_ui.Handler.hallucinations = admin_ui.Hallucinations(root / "h.txt")
         admin_ui.Handler.token = "sekrit"
         cls.server = admin_ui.AdminServer(("127.0.0.1", 0), admin_ui.Handler)
         cls.port = cls.server.server_address[1]
@@ -416,6 +451,191 @@ class TokenAuth(unittest.TestCase):
     def test_the_right_token_in_the_query_works(self):
         """An <audio src> cannot carry an Authorization header."""
         self.assertEqual(self.get("/api/stats?token=sekrit"), 200)
+
+
+class HallucinationFile(unittest.TestCase):
+    """The one thing this tool writes. The store stays read-only; this is a
+    plain text file the scanner reloads every five minutes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "hallucinations.txt"
+        self.path.write_text("Thank you.\nBye.\n", encoding="utf-8")
+        self.filter = admin_ui.Hallucinations(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_existing_phrases_are_read(self):
+        self.assertEqual(self.filter.phrases(), ["Thank you.", "Bye."])
+
+    def test_a_missing_file_reads_as_empty(self):
+        missing = admin_ui.Hallucinations(Path(self.tmp.name) / "nope.txt")
+        self.assertEqual(missing.phrases(), [])
+
+    def test_adding_appends_and_preserves_what_was_there(self):
+        added, count = self.filter.add("Thanks for watching!")
+        self.assertTrue(added)
+        self.assertEqual(count, 3)
+        self.assertEqual(self.filter.phrases(),
+                         ["Thank you.", "Bye.", "Thanks for watching!"])
+
+    def test_the_file_keeps_one_phrase_per_line_and_a_trailing_newline(self):
+        self.filter.add("Okay then.")
+        raw = self.path.read_text(encoding="utf-8")
+        self.assertTrue(raw.endswith("\n"))
+        self.assertEqual(raw.count("\n"), 3)
+
+    def test_adding_a_duplicate_reports_no_change(self):
+        added, count = self.filter.add("Thank you.")
+        self.assertFalse(added)
+        self.assertEqual(count, 2)
+        self.assertEqual(self.filter.phrases().count("Thank you."), 1)
+
+    def test_surrounding_whitespace_is_trimmed_before_comparing(self):
+        added, _ = self.filter.add("   Thank you.   ")
+        self.assertFalse(added, "it is the same phrase")
+
+    def test_an_empty_phrase_is_refused(self):
+        for bad in ("", "   ", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.filter.add(bad)
+
+    def test_a_multi_line_phrase_is_refused(self):
+        """One phrase per line is the whole format — a newline would silently
+        add two entries, one of them probably nonsense."""
+        with self.assertRaises(ValueError):
+            self.filter.add("one\ntwo")
+        with self.assertRaises(ValueError):
+            self.filter.add("one\rtwo")
+
+    def test_a_refused_add_does_not_touch_the_file(self):
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.filter.add("")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_the_write_leaves_no_temp_file_behind(self):
+        self.filter.add("Okay then.")
+        leftovers = [p.name for p in Path(self.tmp.name).iterdir()
+                     if p.name != "hallucinations.txt"]
+        self.assertEqual(leftovers, [])
+
+    def test_the_file_is_created_if_it_does_not_exist(self):
+        fresh = admin_ui.Hallucinations(Path(self.tmp.name) / "new" / "h.txt")
+        added, count = fresh.add("Something.")
+        self.assertTrue(added)
+        self.assertEqual(count, 1)
+        self.assertEqual(fresh.phrases(), ["Something."])
+
+    def test_concurrent_adds_do_not_lose_phrases(self):
+        """Read-modify-write under a lock: without it two threads racing lose
+        one of the additions."""
+        def add(n):
+            self.filter.add(f"phrase {n}")
+        threads = [threading.Thread(target=add, args=(n,)) for n in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        phrases = self.filter.phrases()
+        self.assertEqual(len(phrases), 14)
+        self.assertEqual(len(set(phrases)), 14)
+
+
+class HallucinationEndpoint(ServerFixture, unittest.TestCase):
+
+    def current(self):
+        _, _, body = self.get("/api/hallucinations")
+        return json.loads(body)
+
+    def test_the_count_and_mode_are_reported(self):
+        data = self.current()
+        self.assertGreaterEqual(data["count"], 2)
+        self.assertFalse(data["read_only"])
+
+    def test_a_phrase_can_be_added(self):
+        before = self.current()["count"]
+        status, data = self.post("/api/hallucinations",
+                                 {"phrase": "Please subscribe."})
+        self.assertEqual(status, 200)
+        self.assertTrue(data["added"])
+        self.assertEqual(data["count"], before + 1)
+        self.assertIn("Please subscribe.",
+                      self.filter_path.read_text(encoding="utf-8"))
+
+    def test_a_duplicate_is_reported_rather_than_claimed(self):
+        self.post("/api/hallucinations", {"phrase": "Duplicate me."})
+        status, data = self.post("/api/hallucinations", {"phrase": "Duplicate me."})
+        self.assertEqual(status, 200)
+        self.assertFalse(data["added"],
+                         "the UI should say 'already filtered', not claim a change")
+
+    def test_an_empty_phrase_is_400(self):
+        status, _ = self.post("/api/hallucinations", {"phrase": "  "})
+        self.assertEqual(status, 400)
+
+    def test_a_multi_line_phrase_is_400(self):
+        status, _ = self.post("/api/hallucinations", {"phrase": "a\nb"})
+        self.assertEqual(status, 400)
+
+    def test_a_missing_phrase_key_is_400(self):
+        status, _ = self.post("/api/hallucinations", {})
+        self.assertEqual(status, 400)
+
+    def test_an_unknown_post_route_is_404(self):
+        status, _ = self.post("/api/nope", {"phrase": "x"})
+        self.assertEqual(status, 404)
+
+    # -- CSRF ---------------------------------------------------------------
+    def test_a_post_without_the_custom_header_is_refused(self):
+        """This listens on localhost, which any page the browser visits can
+        reach. A <form> post cannot set a custom header."""
+        status, _ = self.post("/api/hallucinations", {"phrase": "csrf"},
+                              headers={"X-Tent-Floor": None})
+        self.assertEqual(status, 403)
+
+    def test_a_foreign_origin_is_refused(self):
+        status, _ = self.post("/api/hallucinations", {"phrase": "csrf"},
+                              headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_a_matching_origin_is_allowed(self):
+        status, _ = self.post(
+            "/api/hallucinations", {"phrase": "Same origin is fine."},
+            headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(status, 200)
+
+    def test_a_refused_post_does_not_write(self):
+        before = self.filter_path.read_text(encoding="utf-8")
+        self.post("/api/hallucinations", {"phrase": "csrf"},
+                  headers={"X-Tent-Floor": None})
+        self.assertEqual(self.filter_path.read_text(encoding="utf-8"), before)
+
+
+class ReadOnlyMode(ServerFixture, unittest.TestCase):
+    """--read-only leaves search and playback working but refuses the button."""
+
+    read_only = True
+
+    def test_the_mode_is_advertised_so_the_button_can_hide(self):
+        _, _, body = self.get("/api/hallucinations")
+        self.assertTrue(json.loads(body)["read_only"])
+
+    def test_adding_is_refused(self):
+        before = self.filter_path.read_text(encoding="utf-8")
+        status, data = self.post("/api/hallucinations", {"phrase": "nope"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.filter_path.read_text(encoding="utf-8"), before)
+
+    def test_search_still_works(self):
+        _, _, body = self.get("/api/search?q=engine")
+        self.assertGreater(len(json.loads(body)["results"]), 0)
+
+    def test_playback_still_works(self):
+        status, _, _ = self.get(f"/api/clip/{self.clip_id()}")
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":

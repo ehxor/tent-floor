@@ -114,6 +114,22 @@
   }
   .no-clip.expired { color: var(--warn); }
 
+  .actions { margin-top: 8px; }
+
+  .filter-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    padding: 4px 9px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .filter-btn:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); }
+  .filter-btn:disabled { cursor: default; opacity: 0.75; }
+  .filter-btn.done { color: var(--warn); border-color: transparent; }
+
   .empty, .loading {
     text-align: center; color: var(--text-dim);
     font-family: 'JetBrains Mono', monospace;
@@ -178,6 +194,7 @@ const el = {
 
 let offset = 0;
 let inFlight = null;
+let READ_ONLY = true;   // until /api/hallucinations says otherwise
 
 function esc(s) {
   const d = document.createElement('div');
@@ -236,6 +253,11 @@ function rowHtml(r, query) {
     bits.push('<div class="no-clip expired">audio expired — the transcript outlives its clip</div>');
   } else {
     bits.push('<div class="no-clip">no audio kept for this transcript</div>');
+  }
+  if (!READ_ONLY) {
+    bits.push('<div class="actions">' +
+      '<button class="filter-btn" data-text="' + esc(r.text) + '">' +
+      '&#x2298; not speech — add to filter</button></div>');
   }
   bits.push('</div>');
   return bits.join('');
@@ -299,12 +321,48 @@ el.results.addEventListener('play', e => {
   }
 }, true);
 
+// The scanner filters each *line* whisper emits, while a stored transcript is
+// those lines joined. So the phrase is editable rather than submitted blind —
+// pasting a two-line transcript in whole would match nothing forever.
+el.results.addEventListener('click', async e => {
+  const button = e.target.closest('.filter-btn');
+  if (!button) return;
+
+  const phrase = prompt(
+    'Add to hallucinations.txt?\n\n' +
+    'This must match one line of whisper output exactly. Trim it to just the ' +
+    'invented phrase.', button.dataset.text);
+  if (phrase === null) return;
+  if (!phrase.trim()) return;
+
+  button.disabled = true;
+  button.textContent = 'adding…';
+  try {
+    const resp = await fetch(withToken('/api/hallucinations'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Tent-Floor': '1' },
+      body: JSON.stringify({ phrase }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+    button.classList.add('done');
+    button.textContent = data.added
+      ? '\u2298 filtered (' + data.count + ') — live within 5 min'
+      : '\u2298 already filtered';
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = '\u2298 failed: ' + err.message;
+  }
+});
+
 async function boot() {
   try {
-    const [streams, stats] = await Promise.all([
+    const [streams, stats, filter] = await Promise.all([
       fetch(withToken('/api/streams')).then(r => r.json()),
       fetch(withToken('/api/stats')).then(r => r.json()),
+      fetch(withToken('/api/hallucinations')).then(r => r.json()),
     ]);
+    READ_ONLY = !!filter.read_only;
     for (const s of streams.streams) {
       const option = document.createElement('option');
       option.value = s.stream;
