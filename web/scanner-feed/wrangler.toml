@@ -1,13 +1,29 @@
 name = "scanner-feed"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2024-09-23"
 
-# Create a KV namespace in the Cloudflare dashboard, then paste its ID here:
-# Dashboard → Workers & Pages → KV → Create a namespace → copy the ID
+# The event log. A Durable Object rather than KV because ingest used to be a
+# read-modify-write on one KV key with no compare-and-swap — concurrent posts
+# clobbered each other — and KV caps writes at roughly one per second per key,
+# which a busy incident exceeds. A DO serialises its own requests and can hold
+# open connections, which is what makes /v1/stream possible at all.
+[[durable_objects.bindings]]
+name = "FEED_LOG"
+class_name = "FeedLog"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["FeedLog"]
+
+# The KV namespace the v0 ring buffer used. Kept bound but unused, so a rollback
+# to the previous Worker still finds its data; drop it once v1 has bedded in.
 kv_namespaces = [
   { binding = "SCANNER_KV", id = "773238e18e4c46408033b70a129b896b" }
 ]
 
-# Set the ingest token as a secret (not in this file):
-#   npx wrangler secret put INGEST_TOKEN
-# Then paste any random string as the value.
+# Secrets, set with `npx wrangler secret put <NAME>`:
+#   INGEST_TOKEN   the scanner's write token. Also grants full read access,
+#                  so the box doing the transcribing can replay its own feed.
+#   READER_TOKEN   optional. Unlocks transcripts older than the one hour
+#                  live window. Without it the feed is still publicly
+#                  tailable — see docs/architecture.md on tiers.

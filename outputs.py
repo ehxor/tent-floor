@@ -153,21 +153,47 @@ class DiscordDestination:
 
 
 class FeedDestination:
+    """Posts envelopes to the Worker, falling back to the v0 shape if needed.
+
+    The scanner and the Worker deploy independently, so for a while either can
+    be the older one. Rather than a config knob that has to be flipped in the
+    right order, this sends the envelope to /v1/ingest and drops back to the
+    rendered-line /ingest on a 404 — the one status that means "this Worker
+    does not know about v1 yet". The fallback sticks for the life of the
+    process, so it costs one wasted request, not one per event.
+    """
+
     kind = "feed"
 
     def __init__(self, feed_url, feed_token):
-        self.url = feed_url.rstrip("/") + "/ingest"
+        base = feed_url.rstrip("/")
+        self.v1_url = base + "/v1/ingest"
+        self.v0_url = base + "/ingest"
         self.token = feed_token or ""
+        self.use_v1 = True
+
+    def _headers(self):
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": "ScannerFeed/1.0"}
 
     def deliver(self, event):
-        # Still the v0 shape. The Worker learns the envelope in Phase 4; until
-        # then the structured event is rendered back down on the way out.
-        _post(self.url,
+        if self.use_v1:
+            try:
+                _post(self.v1_url, event, self._headers())
+                return
+            except PermanentFailure as e:
+                if "404" not in str(e):
+                    raise
+                print(f"[warn] [feed] {self.v1_url} returned 404; the Worker "
+                      f"predates /v1/ingest. Falling back to the v0 shape — "
+                      f"deploy web/scanner-feed to send structured events.")
+                self.use_v1 = False
+
+        _post(self.v0_url,
               {"line": event["render"]["plain"],
                "type": events.legacy_line_type(event)},
-              {"Content-Type": "application/json",
-               "Authorization": f"Bearer {self.token}",
-               "User-Agent": "ScannerFeed/1.0"})
+              self._headers())
 
 
 # ---------------------------------------------------------------------------

@@ -366,16 +366,44 @@ today, and it is the reason keeping the audio is useful before there is any
 serving layer at all. It shares the store and the clips directory but nothing
 else — no tiering, no cursors, no public surface.
 
-**Phase 4 — edge becomes a log.** A Durable Object replaces the KV ring buffer.
-The current `/ingest` does a read-modify-write against a single key
-(`web/scanner-feed/src/index.js:53-66`) with no compare-and-swap, so concurrent
-posts clobber each other's appends — and Cloudflare KV allows roughly one write
-per second per key, which a busy incident exceeds easily. The DO fixes the race,
-the rate limit, and gives somewhere to hold open subscriber connections.
+**Phase 4 — edge becomes a log.** *Landed.* A Durable Object (`FeedLog`)
+replaces the KV ring buffer. The old `/ingest` did a read-modify-write against
+a single key with no compare-and-swap, so concurrent posts clobbered each
+other's appends — and Cloudflare KV allows roughly one write per second per
+key, which a busy incident exceeds. A DO serialises its own requests, and it
+can hold open connections, which is what makes a live tail possible at all.
 
-`POST /v1/ingest` accepts batches and is idempotent on event ID. `/v1/events`
-and `/v1/stream` are served from the DO with tier enforcement. `/lines` stays as
-a deprecated shim so the current UI and existing scrapers survive the cutover.
+Events are keyed `e:<ulid>` in DO storage. ULIDs sort lexicographically in time
+order, so a key range scan *is* the replay and the cursor a consumer holds stays
+meaningful across capture hosts — which a counter minted at the edge would not
+be. The SSE `id:` field is that same ULID, so a reconnecting browser's
+`Last-Event-ID` is already a valid `since=` for `/v1/events`.
+
+| Route | |
+|---|---|
+| `POST /v1/ingest` | a batch of envelopes, idempotent on ULID (`INGEST_TOKEN`) |
+| `GET /v1/events?since=` | replay, oldest first, with `has_more` and a cursor |
+| `GET /v1/stream?since=` | live tail, backfilling the gap before going live |
+| `GET /lines` | deprecated v0 shim, still what the page polls |
+| `POST /ingest` | deprecated v0 shim, one rendered line |
+
+Tier enforcement lives in `tier.js` because *both* the replay path and the
+Durable Object have to apply it. An earlier draft filtered only on replay,
+which would have streamed every transcript to anyone holding the stream open —
+the exact thing the tiers exist to prevent.
+
+A withheld event still emits its `id` on the stream. Without that a reader
+whose whole page is withheld resumes from before it and is handed the same
+withheld range forever.
+
+Clip URLs are stripped for unauthenticated readers while the rest of the
+`audio` block stays: the clip's existence, length and id are not the secret,
+fetching it is. `url` is still `null` in practice — nothing serves clips
+publicly yet. `admin_ui.py` is how a clip gets listened to today.
+
+The scanner sends envelopes to `/v1/ingest` and falls back to the v0 shape on a
+404, so the Worker and the scanner can deploy in either order without a config
+flag that has to be flipped at the right moment.
 
 **Phase 5 — MQTT mirror and docs.** Optional MQTT output on a topic tree shaped
 like [trunk-recorder's MQTT plugin](https://github.com/TrunkRecorder/tr-plugin-mqtt),
