@@ -49,3 +49,25 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+  worker:
+    # The Worker is the public surface, and Phase 4 gave it behaviour worth
+    # being wrong about: idempotent ingest, a replay cursor, a live tail and
+    # tiers deciding who sees a transcript. miniflare runs a real Durable
+    # Object, so these are not stub tests.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/scanner-feed
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/scanner-feed/package-lock.json
+
+      - run: npm ci
+      - run: npm test
