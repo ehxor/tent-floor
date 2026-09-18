@@ -20,12 +20,25 @@
 
 export const LIVE_WINDOW_MS = 60 * 60 * 1000;
 export const SENSITIVE = "sensitive";
+export const PUBLIC = "public";
+export const KNOWN_TIERS = new Set([PUBLIC, SENSITIVE]);
+
+/** Whether `tier` names a tier this Worker knows to be freely readable.
+ *
+ *  Anything else — a miscased "Sensitive", a typo, a tier added to the producer
+ *  before the edge learned about it — is treated as sensitive. Failing open
+ *  here would publish every transcript at any depth with no error raised in
+ *  either direction, which is precisely what the tiers exist to prevent. A
+ *  tier we do not recognise is one we cannot vouch for. */
+export function isPublicTier(tier) {
+  return tier === PUBLIC;
+}
 
 /** What `event` looks like to this reader, or null if they may not see it. */
 export function forReader(event, { authorised, now = Date.now() }) {
   if (authorised) return event;
 
-  if (event.tier === SENSITIVE) {
+  if (!isPublicTier(event.tier)) {
     const age = now - Date.parse(event.ts);
     // NaN (an unparseable ts) fails this comparison, which withholds the event
     // — the safe direction for anything we cannot date.

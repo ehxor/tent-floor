@@ -20,7 +20,7 @@
 //   npx wrangler secret put READER_TOKEN    # optional; unlocks full replay
 
 import { FeedLog, MAX_BATCH, clampLimit, isUlid } from "./log.js";
-import { forReader, SENSITIVE } from "./tier.js";
+import { forReader, KNOWN_TIERS, PUBLIC, SENSITIVE } from "./tier.js";
 import { HTML_PAGE } from "./page.js";
 
 export { FeedLog };
@@ -72,7 +72,12 @@ function isEnvelope(value) {
     isUlid(value.id) &&
     typeof value.ts === "string" &&
     typeof value.type === "string" &&
-    typeof value.tier === "string"
+    // A tier outside the known set is a producer bug, and the failure mode is
+    // silent disclosure rather than an error: `forReader` now fails closed, so
+    // an unrecognised tier would be withheld from unauthenticated readers
+    // without anyone learning why. Rejecting it here is how the producer finds
+    // out. Adding a tier means shipping the edge first.
+    KNOWN_TIERS.has(value.tier)
   );
 }
 
@@ -139,7 +144,14 @@ async function ingest(request, env) {
     return json({ error: `at most ${MAX_BATCH} events per request` }, 413);
   }
   if (!batch.every(isEnvelope)) {
-    return json({ error: "each event needs id, ts, type and tier" }, 400);
+    return json(
+      {
+        error:
+          "each event needs a ULID id, and string ts and type, and a tier of " +
+          [...KNOWN_TIERS].join(" or "),
+      },
+      400,
+    );
   }
 
   const response = await logStub(env).fetch("https://log/append", {
@@ -176,7 +188,7 @@ async function ingestLegacy(request, env) {
     source: "legacy",
     group: null,
     stream: null,
-    tier: body.type === "transcript" || !body.type ? SENSITIVE : "public",
+    tier: body.type === "transcript" || !body.type ? SENSITIVE : PUBLIC,
     data: { text: body.line },
     render: { plain: body.line, discord: body.line },
   };

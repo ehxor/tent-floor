@@ -363,6 +363,26 @@ describe("tiers", () => {
     const body = await (await get("/v1/events?limit=1")).json();
     assert.ok(body.cursor, "a fully withheld page still reports where it read to");
   });
+
+  it("rejects a tier it does not know", async () => {
+    // The failure this guards is silent in both directions: a miscased or
+    // future tier used to read as public, which published every transcript at
+    // any depth with no error raised anywhere.
+    for (const tier of ["Sensitive", "SENSITIVE", "private", "", "restricted"]) {
+      const response = await post("/v1/ingest", [envelope({ tier })]);
+      assert.equal(response.status, 400, `tier ${JSON.stringify(tier)} is not accepted`);
+    }
+  });
+
+  it("treats an unknown tier as sensitive rather than public", async () => {
+    // Belt and braces with the ingest check above: if an unknown tier ever
+    // reaches storage — written by an older Worker, or a tier this edge has
+    // not learned yet — the read path must still fail closed.
+    const { forReader } = await import("../src/tier.js");
+    const old = { tier: "restricted", ts: new Date(hoursAgo(3)).toISOString(), data: {} };
+    assert.equal(forReader(old, { authorised: false }), null, "withheld from the public");
+    assert.ok(forReader(old, { authorised: true }), "a token still reads it");
+  });
 });
 
 // ---------------------------------------------------------------------------
