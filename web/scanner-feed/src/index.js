@@ -19,7 +19,7 @@
 //   npx wrangler secret put INGEST_TOKEN    # the scanner's write token
 //   npx wrangler secret put READER_TOKEN    # optional; unlocks full replay
 
-import { FeedLog, MAX_BATCH, MAX_LIMIT } from "./log.js";
+import { FeedLog, MAX_BATCH, clampLimit, isUlid } from "./log.js";
 import { forReader, SENSITIVE } from "./tier.js";
 import { HTML_PAGE } from "./page.js";
 
@@ -64,7 +64,12 @@ function isEnvelope(value) {
   return (
     value &&
     typeof value === "object" &&
-    typeof value.id === "string" &&
+    // Not merely a string: the log keys events by id and leans on ULIDs
+    // sorting lexicographically in time order for replay, cursors and pruning.
+    // A non-ULID id sorts outside that range, so it never prunes and is never
+    // reachable as a cursor — and an id containing a newline would inject
+    // arbitrary fields into every subscriber's SSE stream.
+    isUlid(value.id) &&
     typeof value.ts === "string" &&
     typeof value.type === "string" &&
     typeof value.tier === "string"
@@ -122,6 +127,12 @@ async function ingest(request, env) {
     return json({ error: "body must be JSON" }, 400);
   }
 
+  if (!body || typeof body !== "object") {
+    // request.json() happily returns null for the body `null`, and reading
+    // .events off it throws — which the outer handler turns into a 500, the
+    // one class the scanner retries forever.
+    return json({ error: "body must be an object or an array of events" }, 400);
+  }
   const batch = Array.isArray(body) ? body : Array.isArray(body.events) ? body.events : [body];
   if (batch.length === 0) return json({ accepted: 0, duplicates: 0 });
   if (batch.length > MAX_BATCH) {
@@ -203,7 +214,7 @@ function legacyUlid(ms) {
 // -- reading ----------------------------------------------------------------
 async function events(url, env, authorised) {
   const since = url.searchParams.get("since") || "";
-  const limit = Math.min(Number(url.searchParams.get("limit")) || 100, MAX_LIMIT);
+  const limit = clampLimit(url.searchParams.get("limit"));
 
   const response = await logStub(env).fetch(
     `https://log/read?since=${encodeURIComponent(since)}&limit=${limit}`
@@ -226,7 +237,11 @@ async function events(url, env, authorised) {
 }
 
 async function stream(request, url, env, authorised) {
-  const since = url.searchParams.get("since") || request.headers.get("Last-Event-ID") || "";
+  // Last-Event-ID wins. EventSource reconnects to the URL it was constructed
+  // with, so an initial ?since= is still attached on every reconnect while the
+  // header carries where the client actually got to. Preferring the URL would
+  // replay the same backfill after every drop, without bound.
+  const since = request.headers.get("Last-Event-ID") || url.searchParams.get("since") || "";
 
   const response = await logStub(env).fetch(
     `https://log/subscribe?since=${encodeURIComponent(since)}&authorised=${authorised ? 1 : 0}`
@@ -245,13 +260,15 @@ async function stream(request, url, env, authorised) {
 /** The v0 read shape the current page polls. Deprecated; /v1/events is the
  *  surface with the structure in it. */
 async function lines(env, authorised) {
-  const response = await logStub(env).fetch("https://log/read?limit=500");
+  // /latest, not /read: a forward scan returns the *first* keys in the log, so
+  // slicing its tail gives the end of the oldest window rather than the newest
+  // events. Past 500 events that rendered a weeks-old feed forever.
+  const response = await logStub(env).fetch("https://log/latest?limit=50");
   const page = await response.json();
   const now = Date.now();
 
-  const recent = page.events.slice(-50);
   const out = [];
-  for (const event of recent) {
+  for (const event of page.events) {
     const visible = forReader(event, { authorised, now });
     if (!visible) continue;
     out.push({

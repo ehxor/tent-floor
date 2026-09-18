@@ -257,10 +257,20 @@ async function poll() {
       const label = LABELS[line.type] || 'LOG';
       const text = stripEmoji(line.text);
 
-      div.innerHTML =
-        '<span class="time">' + time + '</span>' +
-        '<span class="label">' + label + '</span>' +
-        text;
+      // time and label are safe — one is toLocaleTimeString, the other comes
+      // from a whitelist. text is not: it is whisper output, or for the v0
+      // /ingest shim an arbitrary caller-supplied line. Concatenating it into
+      // innerHTML runs anything it contains in every viewer's browser on the
+      // next poll, which matters more now the feed accepts third-party writes.
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'time';
+      timeSpan.textContent = time;
+
+      const labelSpan = document.createElement('span');
+      labelSpan.className = 'label';
+      labelSpan.textContent = label;
+
+      div.append(timeSpan, labelSpan, document.createTextNode(text));
 
       feed.appendChild(div);
     }

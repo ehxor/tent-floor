@@ -737,7 +737,7 @@ class FeedApiVersion(unittest.TestCase):
         self.assertIn("tier", payload)
 
     def test_a_404_falls_back_to_the_v0_shape(self):
-        self.stub(on_v1=outputs.PermanentFailure("HTTP 404 Not Found"))
+        self.stub(on_v1=outputs.PermanentFailure("HTTP 404 Not Found", status=404))
         self.dest.deliver(self.event())
         urls = [u for u, _ in self.posted]
         self.assertEqual(urls, ["https://feed.example/v1/ingest",
@@ -748,7 +748,7 @@ class FeedApiVersion(unittest.TestCase):
 
     def test_the_fallback_sticks(self):
         """One wasted request, not one per event."""
-        self.stub(on_v1=outputs.PermanentFailure("HTTP 404 Not Found"))
+        self.stub(on_v1=outputs.PermanentFailure("HTTP 404 Not Found", status=404))
         self.dest.deliver(self.event())
         self.posted.clear()
         self.dest.deliver(self.event())
@@ -757,7 +757,7 @@ class FeedApiVersion(unittest.TestCase):
     def test_other_permanent_failures_are_not_swallowed(self):
         """A 401 means a bad token, not an old Worker. Falling back would hide
         it and post to a second endpoint that will also reject."""
-        self.stub(on_v1=outputs.PermanentFailure("HTTP 401 Unauthorized"))
+        self.stub(on_v1=outputs.PermanentFailure("HTTP 401 Unauthorized", status=401))
         with self.assertRaises(outputs.PermanentFailure):
             self.dest.deliver(self.event())
         self.assertTrue(self.dest.use_v1, "still v1; this was not a version problem")
@@ -767,3 +767,72 @@ class FeedApiVersion(unittest.TestCase):
         with self.assertRaises(outputs.RetryableFailure):
             self.dest.deliver(self.event())
         self.assertTrue(self.dest.use_v1)
+
+
+class FeedFallbackPrecision(unittest.TestCase):
+    """The fallback exists for one situation — a Worker that predates
+    /v1/ingest — and must not fire for anything that merely looks like it."""
+
+    def setUp(self):
+        self.dest = outputs.FeedDestination("https://feed.example/", "tok")
+        self.posted = []
+        self._real = outputs._post
+
+    def tearDown(self):
+        outputs._post = self._real
+
+    def event(self):
+        return events.transcript("g", "Mid Island", "engine three", 2.0)
+
+    def stub(self, v1_error=None, v0_error=None):
+        def _post(url, payload, headers):
+            self.posted.append(url)
+            if url.endswith("/v1/ingest") and v1_error:
+                raise v1_error
+            if url.endswith("/ingest") and not url.endswith("/v1/ingest") and v0_error:
+                raise v0_error
+        outputs._post = _post
+
+    def test_the_status_is_carried_not_parsed_out_of_the_message(self):
+        """A reason phrase can contain "404" without the status being 404."""
+        error = outputs.PermanentFailure("HTTP 400 Bad Request: field 404 invalid",
+                                         status=400)
+        self.stub(v1_error=error)
+        with self.assertRaises(outputs.PermanentFailure):
+            self.dest.deliver(self.event())
+        self.assertTrue(self.dest.use_v1, "a 400 is not an old Worker")
+
+    def test_a_misconfigured_url_does_not_latch(self):
+        """A wrong feed_url 404s for both paths. Latching on the v1 404 alone
+        would report "your Worker is old", which is the wrong diagnosis, and
+        then hide the real cause behind it for the life of the process."""
+        not_found = outputs.PermanentFailure("HTTP 404 Not Found", status=404)
+        self.stub(v1_error=not_found, v0_error=not_found)
+        with self.assertRaises(outputs.PermanentFailure):
+            self.dest.deliver(self.event())
+        self.assertTrue(self.dest.use_v1,
+                        "v0 never succeeded, so nothing was proven about v1")
+
+    def test_it_keeps_trying_v1_until_v0_actually_works(self):
+        not_found = outputs.PermanentFailure("HTTP 404 Not Found", status=404)
+        self.stub(v1_error=not_found, v0_error=not_found)
+        for _ in range(3):
+            with self.assertRaises(outputs.PermanentFailure):
+                self.dest.deliver(self.event())
+        self.assertEqual(self.posted.count("https://feed.example/v1/ingest"), 3,
+                         "a bad URL must not be misreported as an old Worker")
+
+    def test_it_latches_once_v0_succeeds(self):
+        self.stub(v1_error=outputs.PermanentFailure("HTTP 404 Not Found", status=404))
+        self.dest.deliver(self.event())
+        self.assertFalse(self.dest.use_v1)
+        self.posted.clear()
+        self.dest.deliver(self.event())
+        self.assertEqual(self.posted, ["https://feed.example/ingest"])
+
+    def test_the_http_classifier_records_the_status(self):
+        import urllib.error
+        err = urllib.error.HTTPError("http://x", 404, "Not Found", {}, None)
+        with self.assertRaises(outputs.PermanentFailure) as caught:
+            outputs._raise_for_http_error(err)
+        self.assertEqual(caught.exception.status, 404)

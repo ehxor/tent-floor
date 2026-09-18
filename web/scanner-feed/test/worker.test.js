@@ -63,7 +63,13 @@ const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 let counter = 0;
 
 /** A ULID with a controllable timestamp, so age-based tier rules are testable
- *  without waiting an hour. */
+ *  without waiting an hour.
+ *
+ *  The counter is encoded in Crockford base32 directly. An earlier version used
+ *  toString(32).toUpperCase() and mapped the letters Crockford omits (I L O U)
+ *  to "0", which collided — 400 distinct events minted in one millisecond
+ *  deduplicated down to 294, and the log was right to reject them.
+ */
 function ulid(ms = Date.now()) {
   let time = "";
   let value = Math.floor(ms);
@@ -71,8 +77,13 @@ function ulid(ms = Date.now()) {
     time = CROCKFORD[value % 32] + time;
     value = Math.floor(value / 32);
   }
-  const n = (counter++).toString(32).toUpperCase().padStart(16, "0");
-  return time + n.replace(/[ILOU]/g, "0");
+  let n = counter++;
+  let rand = "";
+  for (let i = 0; i < 16; i++) {
+    rand = CROCKFORD[n % 32] + rand;
+    n = Math.floor(n / 32);
+  }
+  return time + rand;
 }
 
 function envelope(overrides = {}) {
@@ -501,5 +512,208 @@ describe("v0 compatibility", () => {
 
   it("404s an unknown route", async () => {
     assert.equal((await get("/nope")).status, 404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review of 704beea. Several of these cover limits the local runtime does not
+// enforce — miniflare accepts 500-key storage calls that real Durable Object
+// storage rejects — so where a test cannot reach the failure it asserts the
+// construction that avoids it instead.
+// ---------------------------------------------------------------------------
+describe("storage limits", () => {
+  it("never builds a storage call larger than the API accepts", async () => {
+    const { chunk, STORAGE_BATCH } = await import("../src/log.js");
+    assert.equal(STORAGE_BATCH, 128, "the documented multi-key cap");
+    for (const size of [0, 1, 127, 128, 129, 500, 1000]) {
+      const slices = chunk(Array.from({ length: size }, (_, i) => i));
+      assert.ok(
+        slices.every((s) => s.length <= STORAGE_BATCH),
+        `${size} items produced an oversized slice`
+      );
+      assert.equal(
+        slices.reduce((n, s) => n + s.length, 0),
+        size,
+        "chunking must not lose or duplicate items"
+      );
+    }
+  });
+
+  it("accepts a batch far larger than one storage call", async () => {
+    // miniflare will not reject the oversized get/put this used to make, so
+    // this cannot prove the fix — but it does prove the batch still lands.
+    const batch = Array.from({ length: 400 }, () => envelope());
+    const body = await (await post("/v1/ingest", batch)).json();
+    assert.equal(body.accepted, 400);
+
+    const seen = new Set();
+    let cursor = "";
+    for (let page = 0; page < 10; page++) {
+      const r = await (
+        await get(`/v1/events?since=${cursor}&limit=500`, INGEST_TOKEN)
+      ).json();
+      for (const e of r.events) seen.add(e.id);
+      cursor = r.cursor || cursor;
+      if (!r.has_more) break;
+    }
+    for (const e of batch) assert.ok(seen.has(e.id), "every event is readable back");
+  });
+});
+
+describe("limit handling", () => {
+  it("rejects a limit storage cannot use, rather than 500ing", async () => {
+    for (const bad of ["-1", "0", "1.5", "abc", "-999"]) {
+      const response = await get(`/v1/events?limit=${bad}`, INGEST_TOKEN);
+      assert.equal(response.status, 200, `limit=${bad} should not 500`);
+      const body = await response.json();
+      assert.ok(Array.isArray(body.events));
+    }
+  });
+
+  it("clamps to the maximum", async () => {
+    const { clampLimit } = await import("../src/log.js");
+    assert.equal(clampLimit("99999"), 500);
+    assert.equal(clampLimit("-1"), 100, "falls back rather than going negative");
+    assert.equal(clampLimit("1.9"), 1, "floors rather than passing a fraction");
+    assert.equal(clampLimit(null), 100);
+  });
+});
+
+describe("malformed bodies", () => {
+  it("a JSON null body is a 400, not a 500", async () => {
+    // 5xx is the one class the scanner retries forever, so a malformed payload
+    // answered with 500 is re-posted indefinitely.
+    const response = await post("/v1/ingest", "null");
+    assert.equal(response.status, 400);
+  });
+
+  it("a JSON string body is a 400", async () => {
+    const response = await post("/v1/ingest", '"hello"');
+    assert.equal(response.status, 400);
+  });
+
+  it("a JSON number body is a 400", async () => {
+    assert.equal((await post("/v1/ingest", "42")).status, 400);
+  });
+});
+
+describe("envelope ids", () => {
+  it("rejects an id that is not a ULID", async () => {
+    // The log keys by id and leans on ULID ordering for replay, cursors and
+    // pruning. A non-ULID sorts outside that range: never pruned, never
+    // reachable as a cursor.
+    const response = await post("/v1/ingest", [envelope({ id: "abc123" })]);
+    assert.equal(response.status, 400);
+  });
+
+  it("rejects an id containing a newline", async () => {
+    // `id: ${event.id}\n` would otherwise inject arbitrary SSE fields into
+    // every subscriber's stream.
+    const response = await post("/v1/ingest", [
+      envelope({ id: "01ARZ3NDEKTSV4RRFFQ69G5FAV\nevent: spoofed" }),
+    ]);
+    assert.equal(response.status, 400);
+  });
+
+  it("rejects a lowercase id", async () => {
+    const response = await post("/v1/ingest", [
+      envelope({ id: "01arz3ndektsv4rrffq69g5fav" }),
+    ]);
+    assert.equal(response.status, 400);
+  });
+});
+
+describe("/lines returns the newest events", () => {
+  it("shows recent lines once the log is larger than a page", async () => {
+    // A forward scan returns the *first* keys in the log, so slicing its tail
+    // gave the end of the oldest window. Past 500 events the page rendered a
+    // weeks-old feed forever, which is a regression against the v0 ring buffer.
+    const bulk = Array.from({ length: 300 }, () => publicEvent());
+    for (let i = 0; i < bulk.length; i += 100) {
+      await post("/v1/ingest", bulk.slice(i, i + 100));
+    }
+    const marker = publicEvent({
+      render: { plain: "NEWEST LINE MARKER", discord: "x" },
+    });
+    await post("/v1/ingest", [marker]);
+
+    const body = await (await get("/lines")).json();
+    assert.ok(body.length > 0);
+    assert.ok(
+      body.some((l) => l.text === "NEWEST LINE MARKER"),
+      "the most recent event must appear in /lines"
+    );
+    assert.equal(
+      body[body.length - 1].text,
+      "NEWEST LINE MARKER",
+      "and it must be last, since /lines is chronological"
+    );
+  });
+
+  it("caps at 50 lines", async () => {
+    const body = await (await get("/lines")).json();
+    assert.ok(body.length <= 50);
+  });
+});
+
+describe("cursor precedence", () => {
+  it("Last-Event-ID beats a stale ?since on the URL", async () => {
+    // EventSource reconnects to the URL it was constructed with, so an initial
+    // ?since is re-sent on every reconnect while the header carries where the
+    // client actually reached. Preferring the URL replays the same backfill
+    // after every drop, without bound.
+    const first = envelope();
+    await post("/v1/ingest", [first]);
+    const second = envelope();
+    await post("/v1/ingest", [second]);
+
+    const all = await (await get("/v1/events?limit=500", INGEST_TOKEN)).json();
+    const stale = all.events[all.events.length - 3];
+
+    const response = await mf.dispatchFetch(
+      url(`/v1/stream?since=${stale.id}`),
+      {
+        headers: {
+          Authorization: `Bearer ${INGEST_TOKEN}`,
+          "Last-Event-ID": second.id,
+        },
+      }
+    );
+    const text = await readFrames(response, 6, 2500);
+    const ids = dataFrames(text).map((e) => e.id);
+    assert.ok(
+      !ids.includes(first.id),
+      "the header cursor is newer, so the stale ?since must not replay"
+    );
+  });
+});
+
+describe("gap marking", () => {
+  it("tells a subscriber when the backfill was truncated", async () => {
+    // Going live after a truncated backfill drops the middle with no frame and
+    // no error, and the client's cursor advances past it — making the gap
+    // unrecoverable through /v1/events too.
+    const { MAX_LIMIT } = await import("../src/log.js");
+    const start = ulid(Date.now());
+    await post("/v1/ingest", [envelope()]);
+
+    const bulk = Array.from({ length: MAX_LIMIT + 20 }, () => publicEvent());
+    for (let i = 0; i < bulk.length; i += 200) {
+      await post("/v1/ingest", bulk.slice(i, i + 200));
+    }
+
+    const response = await get(`/v1/stream?since=${start}`, INGEST_TOKEN);
+    const text = await readFrames(response, MAX_LIMIT + 3, 6000);
+    assert.ok(text.includes("event: gap"), "a truncated backfill must say so");
+    assert.ok(text.includes("/v1/events?since="), "and say how to recover");
+  });
+
+  it("does not mark a gap when the backfill was complete", async () => {
+    const start = ulid(Date.now());
+    const few = [envelope(), envelope()];
+    await post("/v1/ingest", few);
+    const response = await get(`/v1/stream?since=${start}`, INGEST_TOKEN);
+    const text = await readFrames(response, 3, 2500);
+    assert.ok(!text.includes("event: gap"));
   });
 });

@@ -27,9 +27,21 @@ export const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_BATCH = 500;
 export const MAX_LIMIT = 500;
 
+// Durable Object storage caps multi-key get/put/delete at 128 items per call
+// and throws past it. miniflare does not enforce that, so no test here can
+// catch an oversized call — the limit has to be respected by construction.
+export const STORAGE_BATCH = 128;
+
 // Prune at most this many keys per ingest, so a long-idle feed catching up
 // cannot spend its whole request budget deleting.
 const PRUNE_BUDGET = 200;
+
+/** Split `items` into slices no larger than the storage API accepts. */
+export function chunk(items, size = STORAGE_BATCH) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
 
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -57,6 +69,15 @@ export function isUlid(value) {
   return typeof value === "string" && ULID_RE.test(value);
 }
 
+/** A whole number in [1, MAX_LIMIT]. Anything else — a negative, a fraction,
+ *  a word — becomes the default rather than reaching storage.list(), which
+ *  throws a RangeError on a limit it cannot use. */
+export function clampLimit(raw, fallback = 100) {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1) return fallback;
+  return Math.min(n, MAX_LIMIT);
+}
+
 const key = (id) => `e:${id}`;
 
 export class FeedLog {
@@ -74,6 +95,8 @@ export class FeedLog {
         return this.append(await request.json());
       case "/read":
         return this.read(url.searchParams);
+      case "/latest":
+        return this.latest(url.searchParams);
       case "/subscribe":
         return this.subscribe(url.searchParams);
       default:
@@ -99,7 +122,17 @@ export class FeedLog {
   // -- writing --------------------------------------------------------------
   async append(events) {
     const accepted = [];
-    const stored = await this.state.storage.get(events.map((e) => key(e.id)));
+
+    // Chunked: MAX_BATCH is 500 and the storage API takes 128 keys per call.
+    // An unchunked get would throw before writing anything, the Worker would
+    // return 500, and the scanner treats 5xx as retryable — so a catching-up
+    // batch would be re-posted forever and never land.
+    const stored = new Set();
+    for (const slice of chunk(events.map((e) => key(e.id)))) {
+      for (const found of (await this.state.storage.get(slice)).keys()) {
+        stored.add(found);
+      }
+    }
 
     const writes = {};
     for (const event of events) {
@@ -107,7 +140,7 @@ export class FeedLog {
       // log already has, and re-broadcasting them would show subscribers the
       // same transmission twice.
       //
-      // `stored` is a snapshot taken before this loop, so it cannot catch a id
+      // `stored` is a snapshot taken before this loop, so it cannot catch an id
       // repeated *within* this batch — writes would collapse to one key but
       // the event would be counted and broadcast twice. Checking the pending
       // writes as well closes that.
@@ -117,7 +150,9 @@ export class FeedLog {
     }
 
     if (accepted.length > 0) {
-      await this.state.storage.put(writes);
+      for (const slice of chunk(Object.entries(writes))) {
+        await this.state.storage.put(Object.fromEntries(slice));
+      }
       this.broadcast(accepted);
     }
 
@@ -136,14 +171,16 @@ export class FeedLog {
       limit: PRUNE_BUDGET,
     });
     if (stale.size === 0) return 0;
-    await this.state.storage.delete([...stale.keys()]);
+    for (const slice of chunk([...stale.keys()])) {
+      await this.state.storage.delete(slice);
+    }
     return stale.size;
   }
 
   // -- reading --------------------------------------------------------------
   async read(params) {
     const since = params.get("since");
-    const limit = Math.min(Number(params.get("limit")) || 100, MAX_LIMIT);
+    const limit = clampLimit(params.get("limit"));
     const events = await this.after(since, limit);
     return Response.json({
       events,
@@ -152,6 +189,26 @@ export class FeedLog {
       has_more: events.length === limit,
       cursor: events.length ? events[events.length - 1].id : since || null,
     });
+  }
+
+  /** The newest `limit` events, oldest first.
+   *
+   *  Distinct from read() because "most recent" cannot be built from a forward
+   *  scan: list() returns the *first* keys in ascending order, so taking the
+   *  last slice of a forward page gives the tail of the oldest window, not the
+   *  newest events. A reverse scan is the only way to reach the end of the log
+   *  without walking all of it.
+   */
+  async latest(params) {
+    const limit = clampLimit(params.get("limit"));
+    const found = await this.state.storage.list({
+      prefix: "e:",
+      limit,
+      reverse: true,
+    });
+    // reverse gives newest first; callers want chronological.
+    const events = [...found.values()].reverse();
+    return Response.json({ events });
   }
 
   // -- live tail ------------------------------------------------------------
@@ -184,6 +241,26 @@ export class FeedLog {
       await subscriber.writer.write(subscriber.encoder.encode(": connected\n\n"));
     });
     for (const event of missed) this.queueSend(subscriber, event);
+
+    if (missed.length === MAX_LIMIT) {
+      // The backfill hit its ceiling, so there is more between the last
+      // backfilled event and live traffic than this stream will carry. Going
+      // straight to live here would drop the middle with no frame and no
+      // error, and the client's cursor would advance past it — making the gap
+      // unrecoverable through /v1/events too. Say so instead.
+      const from = missed[missed.length - 1].id;
+      this.enqueue(subscriber, async () => {
+        await subscriber.writer.write(
+          subscriber.encoder.encode(
+            `event: gap\ndata: ${JSON.stringify({
+              from,
+              reason: "backfill truncated",
+              hint: `replay with /v1/events?since=${from}`,
+            })}\n\n`
+          )
+        );
+      });
+    }
 
     // Returned without awaiting any of the above. Awaiting a write before the
     // Response exists deadlocks: nothing is reading the readable end yet, the
