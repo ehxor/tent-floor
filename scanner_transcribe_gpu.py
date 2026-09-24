@@ -657,14 +657,15 @@ def seed_state(groups, store):
             try:
                 if ptype == "pulsepoint":
                     from pulsepoint_poller import IncidentTracker, fetch_incidents
-                    active, _ = fetch_incidents(poller_cfg["agency"])
-                    if active is None:
-                        print(f"[seed] [{group_name}] pulsepoint: no data returned")
+                    result = fetch_incidents(poller_cfg["agency"])
+                    if not result.ok:
+                        print(f"[seed] [{group_name}] pulsepoint: "
+                              f"{result.error}")
                         continue
                     tracker = IncidentTracker(
                         unit_prefixes=poller_cfg.get("unit_prefix"), store=store,
                         scope=scope, agency=poller_cfg["agency"])
-                    count = len(tracker.update(active))
+                    count = len(tracker.update(result.active))
 
                 elif ptype == "nanaimo_fire":
                     from nanaimo_fire_poller import NanaimoFireTracker, fetch_incidents
@@ -1052,7 +1053,8 @@ def main():
                     pp = PulsePointPoller(agency_id=agency, unit_prefixes=prefixes,
                                           callback=make_pp_cb(out, group_name),
                                           store=store,
-                                          scope=poller_scope(group_name, poller_cfg))
+                                          scope=poller_scope(group_name, poller_cfg),
+                                          group=group_name)
                     pp.start()
                     all_pollers.append(pp)
                     print(f"[init] [{group_name}] PulsePoint poller started (agency: {agency})")

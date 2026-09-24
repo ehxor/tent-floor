@@ -65,7 +65,16 @@ FAILURE_REWARN_S = 300
 # wildfire.removed means a fire dropped out of the upstream feed. It is worth
 # recording — the log keeps it — but it was never announced to Discord or the
 # web feed, and making the log complete should not start announcing it.
-SUPPRESSED_TYPES = frozenset({events.WILDFIRE_REMOVED})
+#
+# The poller health events are recorded for the same reason and withheld for a
+# different one: a Discord channel carrying a public incident feed is the wrong
+# place to learn that a poller is wedged, and a poller failing upstream would
+# push a notice into it every five minutes. They are operator data — read them
+# with `python store.py --health`. Move them out of here if you would rather be
+# paged than have to look.
+SUPPRESSED_TYPES = frozenset({events.WILDFIRE_REMOVED,
+                              events.POLLER_ERROR,
+                              events.POLLER_RECOVERED})
 
 
 class PermanentFailure(Exception):

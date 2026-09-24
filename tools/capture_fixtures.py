@@ -43,7 +43,11 @@ def capture(source, out_dir, agency=None, fire_centre=None):
         from pulsepoint_poller import fetch_incidents
         if not agency:
             raise SystemExit("--agency is required for pulsepoint")
-        snapshot, _ = fetch_incidents(agency)
+        result = fetch_incidents(agency)
+        if not result.ok:
+            print(f"[capture] pulsepoint: {result.error}")
+            return None
+        snapshot = result.active
     elif source == "nanaimo_fire":
         from nanaimo_fire_poller import fetch_incidents
         snapshot = fetch_incidents()
@@ -54,8 +58,7 @@ def capture(source, out_dir, agency=None, fire_centre=None):
         raise SystemExit(f"unknown source: {source}")
 
     if snapshot is None:
-        print(f"[capture] {source}: no data returned "
-              f"(PulsePoint alternates empty responses — try again)")
+        print(f"[capture] {source}: no data returned")
         return None
 
     target = os.path.join(out_dir, source)

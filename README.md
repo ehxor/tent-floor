@@ -243,10 +243,31 @@ That runs one poll of each source, records the results, and announces nothing. T
 
 ```bash
 python store.py --db tentfloor.db            # row counts per table
+python store.py --db tentfloor.db --health   # is each poller reaching its API?
 python store.py --db tentfloor.db --sweep    # force a retention sweep
 
 sqlite3 tentfloor.db \
   "SELECT name, stage_code, size_ha FROM wildfires WHERE gone_at IS NULL"
+```
+
+### Poller health
+
+A poller that cannot reach its upstream records `poller.error` into the event
+log, and records `poller.recovered` with the length of the outage when it comes
+back. These are the answer to "the feed went quiet and I don't know why": they
+name the cause, they outlive the terminal the poller was printing to, and
+`--health` reads them back.
+
+The first failure of a run is recorded immediately, an unchanged failure is
+re-recorded every five minutes rather than every poll, and a failure of a
+different kind starts a new run. They are **not** delivered to Discord or the
+web feed — see `SUPPRESSED_TYPES` in `outputs.py` if you would rather be paged
+than have to look.
+
+```bash
+sqlite3 tentfloor.db \
+  "SELECT ts, json_extract(body,'$.data.kind'), json_extract(body,'$.data.consecutive')
+     FROM events WHERE type = 'poller.error' ORDER BY seq DESC LIMIT 10"
 ```
 
 Pass `--no-store` (or set `store.enabled` to `false`) to run without it. Change detection then falls back to memory and restarts re-announce everything — the pre-store behaviour.
