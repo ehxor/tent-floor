@@ -223,18 +223,27 @@ class FetchResult:
                 f"recent={len(self.recent)})")
 
 
-def fetch_incidents(agency_id):
+def fetch_incidents(agency_id, token=None):
     """Fetch and decrypt active incidents for an agency. Returns a FetchResult.
+
+    `token` is an AWS WAF token from waf_token.py. Without one every request
+    comes back challenged; see that module for where it comes from and why it
+    only lasts five minutes.
 
     Never raises: a poll loop that dies on a transient DNS failure is worse
     than one that reports it.
     """
     url = PULSEPOINT_API_URL.format(agency_id=agency_id)
-    req = urllib.request.Request(url, headers={
+    headers = {
         "User-Agent": "Mozilla/5.0",
         "Origin": "https://web.pulsepoint.org",
         "Referer": "https://web.pulsepoint.org/",
-    })
+    }
+    if token:
+        # The cookie form works too, but a header is the right shape for a
+        # server-side client and does not need a cookie jar.
+        headers["x-aws-waf-token"] = token
+    req = urllib.request.Request(url, headers=headers)
 
     try:
         resp = urllib.request.urlopen(req, timeout=15)
@@ -533,7 +542,7 @@ class PulsePointPoller:
 
     def __init__(self, agency_id, unit_prefixes=None, callback=None,
                  poll_interval=POLL_INTERVAL_S, store=None, scope="",
-                 group=None):
+                 group=None, tokens=None):
         """
         Args:
             agency_id: PulsePoint agency ID (e.g. EMS1201).
@@ -548,6 +557,10 @@ class PulsePointPoller:
                 with different prefixes need different scopes.
             group: the group these events belong to, recorded on the health
                 events so an operator can tell which poller went dark.
+            tokens: a waf_token.TokenCache. The API is behind AWS WAF and
+                returns an empty challenge to every request without a token.
+                None keeps the pre-WAF behaviour, which is to be challenged
+                and to say so.
         """
         self.agency_id = agency_id
         self.tracker = IncidentTracker(unit_prefixes=unit_prefixes, store=store,
@@ -556,6 +569,7 @@ class PulsePointPoller:
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
         self.thread = None
+        self.tokens = tokens
         self.health = events.PollerHealth(
             "pulsepoint", target=agency_id, group=group,
             emit=store.events.append if store is not None else None)
@@ -567,18 +581,40 @@ class PulsePointPoller:
     def stop(self):
         self.stop_event.set()
 
+    def _fetch(self):
+        """One fetch, re-minting the token once if the API rejects it.
+
+        The cached token's expiry is a guess; this response is the fact. A
+        single retry covers the ordinary case of a token ageing out between
+        polls without turning a genuine block into a mint loop.
+        """
+        token = self.tokens.get() if self.tokens is not None else None
+        result = fetch_incidents(self.agency_id, token=token)
+        if (not result.ok and result.error.kind == "waf_challenge"
+                and self.tokens is not None and token is not None):
+            self.tokens.invalidate()
+            result = fetch_incidents(self.agency_id, token=self.tokens.get())
+        return result
+
     def _poll_loop(self):
         while not self.stop_event.is_set():
             try:
-                result = fetch_incidents(self.agency_id)
+                result = self._fetch()
                 if result.ok:
                     self._report(self.health.ok())
                     for event in self.tracker.update(result.active):
                         if self.callback:
                             self.callback(event)
                 else:
+                    detail = result.error.detail
+                    if (result.error.kind == "waf_challenge"
+                            and self.tokens is not None
+                            and self.tokens.last_error):
+                        # Still challenged after a re-mint: the browser side is
+                        # what is broken, and that is the actionable fact.
+                        detail = f"{detail} -- mint failed: {self.tokens.last_error}"
                     self._report(self.health.failed(
-                        result.error.kind, result.error.detail,
+                        result.error.kind, detail,
                         retryable=result.error.retryable))
             except Exception as e:
                 # The fetch does not raise, so anything here came from the

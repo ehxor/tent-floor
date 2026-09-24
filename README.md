@@ -272,6 +272,51 @@ sqlite3 tentfloor.db \
 
 Pass `--no-store` (or set `store.enabled` to `false`) to run without it. Change detection then falls back to memory and restarts re-announce everything — the pre-store behaviour.
 
+### PulsePoint and AWS WAF
+
+In September 2026 PulsePoint put `api.pulsepoint.org/v1/webapp` behind AWS WAF.
+Every request without a token now returns `202` with an empty body and
+`x-amzn-waf-action: challenge`. The poller reports this as `waf_challenge` and
+says a retry will not help, because it will not.
+
+`web.pulsepoint.org` loads AWS's WAF JavaScript SDK, which solves the challenge
+and hands the page a token. `waf_token.py` does the same thing in a real
+browser, calling the SDK's documented `getToken()`. Nothing reimplements or
+forges the challenge — if the browser cannot solve it, the mint fails like any
+other error and is recorded as one.
+
+```bash
+pip install playwright && playwright install chromium
+
+python waf_token.py --mint     # print a token
+python waf_token.py --check    # mint one, then use it against the live API
+```
+
+Measured against the live API on 2026-09-24:
+
+| | |
+|---|---|
+| Token lifetime | ~300s (the AWS default immunity time) |
+| Accepted as | `x-aws-waf-token` header **or** `aws-waf-token` cookie |
+| Bound to client? | No — a token minted on one host works from another IP and TLS stack |
+
+Five minutes is the constraint that shapes everything else. A token cannot be
+supplied by hand, so one is minted on demand and cached in the `kv` table,
+shared by every PulsePoint poller in the process, and refreshed a minute before
+it is due to expire. Each mint runs in a short-lived subprocess that is killed
+if it hangs — a wedged browser inside the scanner would otherwise need a
+restart, taking the radio streams down with it.
+
+The TTL is an optimisation, not the correctness condition. A `waf_challenge`
+response invalidates the cached token and forces one fresh mint, so if
+PulsePoint changes the immunity time it costs a single wasted request rather
+than an outage.
+
+**Playwright is optional.** Without it the scanner runs exactly as before and
+the PulsePoint poller reports `waf_challenge`, naming the missing dependency in
+the health event so it is obvious from `--health` rather than a traceback. The
+other pollers are unaffected.
+
 ## Usage
 
 Run with config file (recommended):

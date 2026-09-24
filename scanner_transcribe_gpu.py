@@ -637,7 +637,7 @@ def load_config(config_path):
 # ===================================================================
 # Cutover seeding
 # ===================================================================
-def seed_state(groups, store):
+def seed_state(groups, store, waf_tokens=None):
     """Populate an empty store from one poll of each source, announcing nothing.
 
     Only needed once, at cutover. The pollers no longer suppress their first
@@ -657,7 +657,9 @@ def seed_state(groups, store):
             try:
                 if ptype == "pulsepoint":
                     from pulsepoint_poller import IncidentTracker, fetch_incidents
-                    result = fetch_incidents(poller_cfg["agency"])
+                    result = fetch_incidents(
+                        poller_cfg["agency"],
+                        token=waf_tokens.get() if waf_tokens else None)
                     if not result.ok:
                         print(f"[seed] [{group_name}] pulsepoint: "
                               f"{result.error}")
@@ -936,8 +938,18 @@ def main():
                                      feed_url=out.feed_url,
                                      feed_token=out.feed_token)
 
+    # One TokenCache for the whole process. The shipped config runs two
+    # PulsePoint pollers against the same agency with different unit filters;
+    # the token is not per-request, so they share one rather than each
+    # launching a browser every few minutes.
+    waf_tokens = None
+    if any(p["type"] == "pulsepoint"
+           for g in groups.values() for p in g["pollers"]):
+        import waf_token
+        waf_tokens = waf_token.TokenCache(store=store)
+
     if args.seed:
-        seed_state(groups, store)
+        seed_state(groups, store, waf_tokens=waf_tokens)
         return
 
     if not all_streams:
@@ -1054,7 +1066,8 @@ def main():
                                           callback=make_pp_cb(out, group_name),
                                           store=store,
                                           scope=poller_scope(group_name, poller_cfg),
-                                          group=group_name)
+                                          group=group_name,
+                                          tokens=waf_tokens)
                     pp.start()
                     all_pollers.append(pp)
                     print(f"[init] [{group_name}] PulsePoint poller started (agency: {agency})")

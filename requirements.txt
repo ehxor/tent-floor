@@ -1,3 +1,15 @@
 cryptography
 packaging
 numpy
+
+# Optional. Only the PulsePoint poller needs it: the API is behind AWS WAF and
+# every request without a token is answered with an empty challenge, so a real
+# browser has to mint one every few minutes (see waf_token.py). The browser
+# itself is a separate download:
+#
+#     pip install playwright && playwright install chromium
+#
+# Without it the scanner runs unchanged and the PulsePoint poller reports
+# waf_challenge instead of returning incidents. Left uninstalled by default so
+# a headless box does not pull 95MB of Chromium it may not want.
+# playwright
