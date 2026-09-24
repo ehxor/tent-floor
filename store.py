@@ -581,6 +581,32 @@ class EventLog:
             rows = self.store.conn.execute(sql, params).fetchall()
         return [(row["seq"], json.loads(row["body"])) for row in rows]
 
+    def recent(self, types=None, limit=20, group=None):
+        """Most recent events, newest first.
+
+        A diagnostic read, not a delivery path: it ignores cursors and does
+        not advance anything. `store.py --health` uses it to answer "is this
+        poller working", which before this had no answer that outlived the
+        terminal the poller was printing to.
+        """
+        sql = "SELECT seq, body FROM events"
+        where = []
+        params = []
+        if types:
+            types = list(types)
+            where.append(f"type IN ({', '.join('?' * len(types))})")
+            params.extend(types)
+        if group is not None:
+            where.append("group_name = ?")
+            params.append(group)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY seq DESC LIMIT ?"
+        params.append(limit)
+        with self.store.lock:
+            rows = self.store.conn.execute(sql, params).fetchall()
+        return [(row["seq"], json.loads(row["body"])) for row in rows]
+
     def latest_seq(self, group=None):
         """The head of the log, optionally for one group.
 
@@ -784,6 +810,44 @@ class Store:
 # ---------------------------------------------------------------------------
 # Standalone mode
 # ---------------------------------------------------------------------------
+# Kept as strings rather than importing events.py: this module is the bottom
+# of the stack and nothing else here needs that dependency.
+HEALTH_TYPES = ("poller.error", "poller.recovered")
+
+
+def print_health(store, limit=20):
+    """Each poller's most recent health event.
+
+    The log holds the history; this answers the only question worth asking
+    first, which is whether the thing is working right now. A poller with no
+    row at all has either never failed or never started, and those are not
+    the same — the row count is printed so an empty log reads as "nothing has
+    been recorded" rather than "everything is fine".
+    """
+    rows = store.events.recent(types=HEALTH_TYPES, limit=limit)
+    print(f"[store] {store.path}: {len(rows)} health event(s) "
+          f"in the last {limit} scanned")
+    print("-" * 52)
+    if not rows:
+        print("  none recorded")
+        return
+
+    latest = {}
+    for _, event in rows:          # newest first, so the first wins
+        data = event.get("data", {})
+        key = (data.get("poller"), data.get("target"), event.get("group"))
+        latest.setdefault(key, event)
+
+    for (poller, target, group), event in sorted(
+            latest.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
+        label = f"{poller} {target}" if target else str(poller)
+        if group:
+            label += f" [{group}]"
+        state = "FAILING" if event["type"] == "poller.error" else "ok"
+        print(f"  {label:36} {state}")
+        print(f"      {event['ts']}  {event['render']['plain']}")
+
+
 def main():
     import argparse
 
@@ -792,9 +856,17 @@ def main():
     parser.add_argument("--sweep", action="store_true",
                         help="Run the retention sweep and exit")
     parser.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
+    parser.add_argument("--health", action="store_true",
+                        help="Show each poller's latest health event and exit")
+    parser.add_argument("--health-limit", type=int, default=20,
+                        help="How many health events to scan back through")
     args = parser.parse_args()
 
     store = Store(args.db, retention_days=args.retention_days)
+
+    if args.health:
+        print_health(store, limit=args.health_limit)
+        return
 
     if args.sweep:
         removed, events_removed, unconsumed = store.sweep()

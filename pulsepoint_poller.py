@@ -25,9 +25,11 @@ import json
 import sys
 import time
 import threading
+import urllib.error
 import urllib.request
 from datetime import datetime
 
+import events
 from store import Store
 
 try:
@@ -146,9 +148,87 @@ def decrypt_pulsepoint(data):
 
 # ---------------------------------------------------------------------------
 # API fetch
+#
+# Every way this can fail used to collapse into `return None, None`, and two
+# of the three paths did it without printing anything. The caller could not
+# tell an agency with no active calls from an unreachable API, and the one
+# message it did produce — "no data returned (try again — PulsePoint
+# alternates responses)" — told an operator to retry something that would
+# never succeed. PulsePoint moved behind AWS WAF in September 2026 and spent
+# eight days answering every poll with an empty 202 challenge under exactly
+# that message.
+#
+# So a failed fetch now names its own cause. The kinds:
+#
+#   waf_challenge  — AWS WAF wants a JS challenge solved. Retrying the same
+#                    request never works; this needs a token from a browser
+#                    session, so it is flagged non-retryable.
+#   http_error     — upstream answered with a 4xx/5xx.
+#   network        — DNS, TLS, connection, timeout. Ordinary transient.
+#   empty_response — 200 with nothing in it. PulsePoint genuinely does this
+#                    on alternate polls, which is why it stays distinct from
+#                    waf_challenge rather than being assumed to be one.
+#   malformed      — the body was not the JSON envelope we expect.
+#   decrypt_failed — the envelope decrypted to something unusable, which is
+#                    how a change to their key derivation would show up.
 # ---------------------------------------------------------------------------
+WAF_ACTION_HEADER = "x-amzn-waf-action"
+
+
+class FetchError:
+    """Why a poll produced no incidents.
+
+    `retryable` is about this specific request shape, not about whether the
+    poller should keep running — it always keeps running. False means a plain
+    retry is known to be pointless and something has to change first.
+    """
+
+    __slots__ = ("kind", "detail", "retryable")
+
+    def __init__(self, kind, detail, retryable=True):
+        self.kind = kind
+        self.detail = detail
+        self.retryable = retryable
+
+    def __repr__(self):
+        return f"FetchError(kind={self.kind!r}, detail={self.detail!r})"
+
+    def __str__(self):
+        return f"{self.kind}: {self.detail}"
+
+
+class FetchResult:
+    """The outcome of one fetch: incidents, or a reason there are none.
+
+    `active` is None on failure and a list (possibly empty) on success, so
+    `if result.active is not None` still distinguishes "nothing is happening"
+    from "we could not look" the way the old tuple did.
+    """
+
+    __slots__ = ("active", "recent", "error")
+
+    def __init__(self, active=None, recent=None, error=None):
+        self.active = active
+        self.recent = recent
+        self.error = error
+
+    @property
+    def ok(self):
+        return self.error is None
+
+    def __repr__(self):
+        if self.error is not None:
+            return f"FetchResult(error={self.error!r})"
+        return (f"FetchResult(active={len(self.active)}, "
+                f"recent={len(self.recent)})")
+
+
 def fetch_incidents(agency_id):
-    """Fetch and decrypt active incidents for an agency."""
+    """Fetch and decrypt active incidents for an agency. Returns a FetchResult.
+
+    Never raises: a poll loop that dies on a transient DNS failure is worse
+    than one that reports it.
+    """
     url = PULSEPOINT_API_URL.format(agency_id=agency_id)
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0",
@@ -158,21 +238,61 @@ def fetch_incidents(agency_id):
 
     try:
         resp = urllib.request.urlopen(req, timeout=15)
+        status = getattr(resp, "status", None) or resp.getcode()
+        waf = resp.headers.get(WAF_ACTION_HEADER)
         raw_text = resp.read().decode()
-        if not raw_text or len(raw_text) < 10:
-            return None, None  # Empty response (alternating poll pattern)
-
-        raw = json.loads(raw_text)
-        data = decrypt_pulsepoint(raw)
-
-        active = data.get("incidents", {}).get("active", [])
-        recent = data.get("incidents", {}).get("recent", [])
-        return active, recent
-    except json.JSONDecodeError:
-        return None, None  # PulsePoint sometimes returns empty on alternate polls
+    except urllib.error.HTTPError as e:
+        # A challenge can arrive as an error status too, so check it first.
+        waf = e.headers.get(WAF_ACTION_HEADER) if e.headers else None
+        if waf:
+            return FetchResult(error=FetchError(
+                "waf_challenge",
+                f"HTTP {e.code} with {WAF_ACTION_HEADER}: {waf}",
+                retryable=False))
+        return FetchResult(error=FetchError(
+            "http_error", f"HTTP {e.code} {e.reason}"))
+    except urllib.error.URLError as e:
+        return FetchResult(error=FetchError(
+            "network", f"{type(e.reason).__name__}: {e.reason}"))
     except Exception as e:
-        print(f"[pulsepoint] Error fetching data: {e}", file=sys.stderr)
-        return None, None
+        return FetchResult(error=FetchError(
+            "network", f"{type(e).__name__}: {e}"))
+
+    if waf:
+        # 202 + an empty body + this header is AWS WAF asking for a JS
+        # challenge to be solved. urllib cannot, so this recurs forever.
+        return FetchResult(error=FetchError(
+            "waf_challenge",
+            f"HTTP {status} with {WAF_ACTION_HEADER}: {waf} "
+            f"(blocked as a bot; needs a browser-issued token)",
+            retryable=False))
+
+    if not raw_text or len(raw_text) < 10:
+        return FetchResult(error=FetchError(
+            "empty_response",
+            f"HTTP {status} with {len(raw_text)} byte(s)"))
+
+    try:
+        raw = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return FetchResult(error=FetchError(
+            "malformed", f"body is not JSON ({e}): {raw_text[:120]!r}"))
+
+    try:
+        data = decrypt_pulsepoint(raw)
+    except Exception as e:
+        return FetchResult(error=FetchError(
+            "decrypt_failed", f"{type(e).__name__}: {e}", retryable=False))
+
+    incidents = data.get("incidents")
+    if not isinstance(incidents, dict):
+        return FetchResult(error=FetchError(
+            "decrypt_failed",
+            f"decrypted payload has no incidents object: {sorted(data)[:8]}",
+            retryable=False))
+
+    return FetchResult(active=incidents.get("active", []),
+                       recent=incidents.get("recent", []))
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +532,8 @@ class PulsePointPoller:
     """Background thread that polls PulsePoint and calls a callback with events."""
 
     def __init__(self, agency_id, unit_prefixes=None, callback=None,
-                 poll_interval=POLL_INTERVAL_S, store=None, scope=""):
+                 poll_interval=POLL_INTERVAL_S, store=None, scope="",
+                 group=None):
         """
         Args:
             agency_id: PulsePoint agency ID (e.g. EMS1201).
@@ -420,9 +541,13 @@ class PulsePointPoller:
             callback: function called with each event dict.
             poll_interval: seconds between polls.
             store: a store.Store for durable change detection. Without one,
-                every restart re-announces all active incidents.
+                every restart re-announces all active incidents. Its event log
+                is also where this poller records its own health, so without
+                one a failing poller is once again only visible on stderr.
             scope: isolates this poller's rows. Two pollers on the same agency
                 with different prefixes need different scopes.
+            group: the group these events belong to, recorded on the health
+                events so an operator can tell which poller went dark.
         """
         self.agency_id = agency_id
         self.tracker = IncidentTracker(unit_prefixes=unit_prefixes, store=store,
@@ -431,6 +556,9 @@ class PulsePointPoller:
         self.poll_interval = poll_interval
         self.stop_event = threading.Event()
         self.thread = None
+        self.health = events.PollerHealth(
+            "pulsepoint", target=agency_id, group=group,
+            emit=store.events.append if store is not None else None)
 
     def start(self):
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
@@ -442,16 +570,31 @@ class PulsePointPoller:
     def _poll_loop(self):
         while not self.stop_event.is_set():
             try:
-                active, recent = fetch_incidents(self.agency_id)
-                if active is not None:
-                    events = self.tracker.update(active)
-                    for event in events:
+                result = fetch_incidents(self.agency_id)
+                if result.ok:
+                    self._report(self.health.ok())
+                    for event in self.tracker.update(result.active):
                         if self.callback:
                             self.callback(event)
+                else:
+                    self._report(self.health.failed(
+                        result.error.kind, result.error.detail,
+                        retryable=result.error.retryable))
             except Exception as e:
-                print(f"[pulsepoint] Poll error: {e}", file=sys.stderr)
+                # The fetch does not raise, so anything here came from the
+                # tracker or the callback. It is still this poller's health.
+                self._report(self.health.failed(
+                    "internal", f"{type(e).__name__}: {e}"))
 
             self.stop_event.wait(self.poll_interval)
+
+    @staticmethod
+    def _report(health_event):
+        """Mirror a health event to stderr. The event log is the record; this
+        is for whoever happens to be watching the terminal."""
+        if health_event is not None:
+            print(f"[pulsepoint] {health_event['render']['plain']}",
+                  file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -477,16 +620,21 @@ def main():
 
     if args.dump:
         print(f"[pulsepoint] Fetching incidents for agency {args.agency}...")
-        active, recent = fetch_incidents(args.agency)
-        if active is not None:
-            print(f"\n=== {len(active)} active incidents ===\n")
-            print(json.dumps(active, indent=2))
-            print(f"\n=== {len(recent)} recent incidents ===\n")
-            if recent:
-                print(json.dumps(recent[:3], indent=2))
-                print(f"... ({len(recent) - 3} more)")
-        else:
-            print("[pulsepoint] No data returned (try again — PulsePoint alternates responses)")
+        result = fetch_incidents(args.agency)
+        if not result.ok:
+            print(f"[pulsepoint] FAILED ({result.error.kind}): "
+                  f"{result.error.detail}", file=sys.stderr)
+            if not result.error.retryable:
+                print("[pulsepoint] Retrying this request will not help.",
+                      file=sys.stderr)
+            sys.exit(1)
+        active, recent = result.active, result.recent
+        print(f"\n=== {len(active)} active incidents ===\n")
+        print(json.dumps(active, indent=2))
+        print(f"\n=== {len(recent)} recent incidents ===\n")
+        if recent:
+            print(json.dumps(recent[:3], indent=2))
+            print(f"... ({len(recent) - 3} more)")
         return
 
     print(f"[pulsepoint] Polling agency {args.agency} every {args.interval}s")
@@ -495,15 +643,27 @@ def main():
     print("-" * 60)
 
     tracker = IncidentTracker(unit_prefixes=args.unit_prefix)
+    # No store in standalone mode, so nothing to append to — the health
+    # object is here for its throttling, and the render strings go to stderr.
+    health = events.PollerHealth("pulsepoint", target=args.agency)
 
     try:
         while True:
-            active, recent = fetch_incidents(args.agency)
-            if active is not None:
-                events = tracker.update(active)
-                for event in events:
+            result = fetch_incidents(args.agency)
+            if result.ok:
+                recovered = health.ok()
+                if recovered is not None:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                          f"{recovered['render']['plain']}", file=sys.stderr)
+                for event in tracker.update(result.active):
                     ts = datetime.now().strftime("%H:%M:%S")
                     print(f"[{ts}] {format_event(event)}")
+            else:
+                failure = health.failed(result.error.kind, result.error.detail,
+                                        retryable=result.error.retryable)
+                if failure is not None:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                          f"{failure['render']['plain']}", file=sys.stderr)
 
             time.sleep(args.interval)
 

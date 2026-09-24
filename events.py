@@ -38,6 +38,7 @@ import os
 import random
 import socket
 import threading
+import time
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
@@ -57,6 +58,12 @@ CAD_NFR_INCIDENT = "cad.nfr.incident"
 WILDFIRE_DECLARED = "wildfire.declared"
 WILDFIRE_UPDATE = "wildfire.update"
 WILDFIRE_REMOVED = "wildfire.removed"
+
+# Health of a poller itself, rather than anything it observed. These exist
+# because a poller that cannot reach its upstream had nowhere to say so: it
+# printed to stderr and the process outlived the terminal that was reading it.
+POLLER_ERROR = "poller.error"
+POLLER_RECOVERED = "poller.recovered"
 
 # ---------------------------------------------------------------------------
 # Tiers
@@ -282,3 +289,154 @@ def poller(group, poller_event, render_plain, render_discord):
         event_type, data, group, stream=None, tier=TIER_PUBLIC,
         render_plain=render_plain, render_discord=render_discord,
     )
+
+
+# ---------------------------------------------------------------------------
+# Poller health
+#
+# Everything above describes what a poller saw. This describes whether it saw
+# anything at all, which until now was only ever a line on stderr. PulsePoint
+# went behind a WAF and started answering every poll with an empty challenge
+# response for eight days; the poller reported that as "no data returned (try
+# again)" into a pipe nobody was reading, and the first anyone knew of it was
+# noticing the feed had gone quiet.
+# ---------------------------------------------------------------------------
+
+# A poller failing every 30s would write 2,880 rows a day, so an unchanged
+# failure is re-recorded on this interval rather than every poll. It matches
+# outputs.FAILURE_REWARN_S, which solves the same problem for deliveries.
+HEALTH_REWARN_S = 300
+
+
+def _duration(seconds):
+    """Compact human duration for a render string."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+
+
+class PollerHealth:
+    """Turns a poller's per-poll outcome into a few durable events.
+
+    The policy between "one row per failed poll" and "one row and then
+    silence forever":
+
+      * the first failure of a run is recorded immediately,
+      * a failure of a *different* kind ends the current run and starts a
+        new one, so a WAF block that follows a week of timeouts is visible
+        as its own thing rather than folded into the timeouts,
+      * an unchanged failure is re-recorded every `rewarn_s`, so a long
+        outage leaves a trail with a length instead of a single old row,
+      * the first success after a run records how long the outage lasted
+        and how many polls it swallowed.
+
+    `emit` takes a callable rather than a store.EventLog so this module stays
+    stdlib-only and store.py keeps not importing it. Pass `log.append`.
+
+    Not thread-safe: one instance belongs to one poller thread.
+    """
+
+    def __init__(self, poller, target=None, group=None, emit=None,
+                 rewarn_s=HEALTH_REWARN_S, clock=time.monotonic):
+        self.poller = poller
+        self.target = target
+        self.group = group
+        self.emit = emit
+        self.rewarn_s = rewarn_s
+        self.clock = clock
+        self.kind = None            # failure kind of the open run; None = healthy
+        self.detail = None
+        self.consecutive = 0
+        self.since = None           # RFC3339 of the run's first failure
+        self._since_mono = None
+        self._last_report_mono = None
+
+    @property
+    def failing(self):
+        return self.kind is not None
+
+    def _label(self):
+        return f"{self.poller} {self.target}" if self.target else self.poller
+
+    def _publish(self, event):
+        if self.emit is not None:
+            self.emit(event)
+        return event
+
+    def failed(self, kind, detail, retryable=True):
+        """Record one failed poll. Returns the event if one was emitted.
+
+        Returns None when the failure was folded into the open run, which is
+        the common case — the caller should treat None as "already known",
+        not as "nothing happened".
+        """
+        now = self.clock()
+        if kind != self.kind:
+            self.kind = kind
+            self.consecutive = 0
+            self.since = utc_now()
+            self._since_mono = now
+            self._last_report_mono = None
+        self.detail = detail
+        self.consecutive += 1
+
+        if (self._last_report_mono is not None
+                and now - self._last_report_mono < self.rewarn_s):
+            return None
+        self._last_report_mono = now
+
+        elapsed = now - self._since_mono
+        label = self._label()
+        if self.consecutive == 1:
+            plain = f"⚠️  {label}: {detail}"
+        else:
+            plain = (f"⚠️  {label}: {detail} "
+                     f"(×{self.consecutive} over {_duration(elapsed)})")
+        return self._publish(envelope(
+            POLLER_ERROR,
+            {
+                "poller": self.poller,
+                "target": self.target,
+                "kind": kind,
+                "detail": detail,
+                "retryable": retryable,
+                "consecutive": self.consecutive,
+                "since": self.since,
+                "failing_for_s": round(elapsed, 3),
+            },
+            self.group, tier=TIER_SENSITIVE,
+            render_plain=plain, render_discord=plain,
+        ))
+
+    def ok(self):
+        """Record a successful poll. Returns a recovery event, or None if the
+        poller was already healthy."""
+        if self.kind is None:
+            return None
+
+        elapsed = self.clock() - self._since_mono
+        kind, consecutive, since = self.kind, self.consecutive, self.since
+        self.kind = self.detail = self.since = None
+        self._since_mono = self._last_report_mono = None
+        self.consecutive = 0
+
+        plain = (f"✅ {self._label()}: recovered after {consecutive} failed "
+                 f"poll(s) over {_duration(elapsed)} ({kind})")
+        return self._publish(envelope(
+            POLLER_RECOVERED,
+            {
+                "poller": self.poller,
+                "target": self.target,
+                "kind": kind,
+                "consecutive": consecutive,
+                "since": since,
+                "outage_s": round(elapsed, 3),
+            },
+            self.group, tier=TIER_SENSITIVE,
+            render_plain=plain, render_discord=plain,
+        ))
