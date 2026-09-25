@@ -52,12 +52,52 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 ```bash
 cd web/scanner-feed
-npx wrangler kv namespace create SCANNER_KV
-# Add the created ID to web/scanner-feed/wrangler.toml
-# Then deploy with:
-npx wrangler deploy
-npx wrangler secret put INGEST_TOKEN  # Set your auth token
+npx wrangler deploy                    # creates the FeedLog Durable Object
+npx wrangler secret put INGEST_TOKEN   # the scanner's write token
+npx wrangler secret put READER_TOKEN   # optional; unlocks full transcript replay
 ```
+
+The KV namespace the old ring buffer used is still bound but unused, so a rollback to the previous Worker finds its data. Drop it from `wrangler.toml` once v1 has bedded in.
+
+## Feed API
+
+The Worker is an append-only event log. Consumers read it two ways over the same cursor — a live tail for what is happening now, replay for what was missed.
+
+| Route | Purpose |
+|-------|---------|
+| `GET /v1/stream?since=<ulid>` | Live tail (SSE). Backfills the gap from `since` before going live. |
+| `GET /v1/events?since=<ulid>&limit=` | Replay, oldest first. Returns `has_more` and a `cursor`. |
+| `POST /v1/ingest` | A batch of envelopes. Idempotent on event id. Needs `INGEST_TOKEN`. |
+| `GET /lines` | Deprecated v0 shape, still what the feed page polls. |
+| `POST /ingest` | Deprecated v0 shape, one rendered line. |
+
+Event ids are ULIDs, which sort lexicographically in time order. The SSE `id:` field is that id, so a browser's automatic `Last-Event-ID` on reconnect is already a valid `since=`:
+
+```js
+const feed = new EventSource("https://your-feed.workers.dev/v1/stream");
+feed.addEventListener("transcript.final", (e) => {
+  const event = JSON.parse(e.data);
+  console.log(event.stream, event.data.text);
+});
+```
+
+```bash
+curl -N https://your-feed.workers.dev/v1/stream
+curl "https://your-feed.workers.dev/v1/events?since=01K2ZQ8XJ4M7VN0C3R5T9WBFHD"
+```
+
+### Access tiers
+
+Reading is tiered by depth rather than being all-or-nothing:
+
+- **Anyone** can tail the feed live and look back one hour. That is roughly what a scanner in a kitchen already offers.
+- **`public` events** — CAD, wildfire, tone pages — are readable at any depth. They are restructured from APIs the agencies already publish, so republishing them is not a new disclosure.
+- **`sensitive` events** — transcripts — need `READER_TOKEN` beyond the live window. Radio is broadcast and gone until we write it down, and an indexed archive of it is a different object.
+- **Clip URLs** are stripped for unauthenticated readers; the rest of the `audio` block stays, so a consumer can still tell a transcript with audio from one without.
+
+An `EventSource` cannot set headers, so `/v1/stream?token=…` is accepted as well as `Authorization: Bearer`.
+
+The schema and its stability policy are in [`docs/architecture.md`](docs/architecture.md). `render.plain` exists so the old page keeps working and is **not** part of the stable contract — parse `data`.
 
 ## Secrets
 

@@ -195,3 +195,24 @@ class Time(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TierValidation(unittest.TestCase):
+    def test_known_tiers_are_accepted(self):
+        for tier in events.KNOWN_TIERS:
+            self.assertEqual(
+                events.envelope("x.y", {}, "g", tier=tier)["tier"], tier
+            )
+
+    def test_unknown_tier_is_refused_at_the_emit_site(self):
+        # The edge 400s an unknown tier and outputs.py treats 400 as permanent,
+        # so letting one through here would drop events instead of retrying.
+        for tier in ("Sensitive", "SENSITIVE", "private", "", None):
+            with self.assertRaises(ValueError):
+                events.envelope("x.y", {}, "g", tier=tier)
+
+    def test_transcripts_are_sensitive_and_tones_are_public(self):
+        self.assertEqual(
+            events.transcript("g", "s", "text", 1.0)["tier"], events.TIER_SENSITIVE
+        )
+        self.assertIn(events.TIER_PUBLIC, events.KNOWN_TIERS)

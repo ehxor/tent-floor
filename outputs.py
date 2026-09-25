@@ -80,7 +80,16 @@ SUPPRESSED_TYPES = frozenset({events.WILDFIRE_REMOVED,
 class PermanentFailure(Exception):
     """This event will never be accepted: a malformed payload, a deleted
     webhook. Retrying blocks every event behind it, so the worker logs it
-    loudly and moves on."""
+    loudly and moves on.
+
+    `status` carries the HTTP code where there was one, so a caller can test
+    for a specific status instead of matching a substring of the message —
+    "404" also appears in, say, a reason phrase.
+    """
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class RetryableFailure(Exception):
@@ -127,7 +136,7 @@ def _raise_for_http_error(e):
     if e.code in RETRYABLE_CLIENT_CODES:
         raise RetryableFailure(f"HTTP {e.code} {e.reason}", bounded=True)
     if 400 <= e.code < 500:
-        raise PermanentFailure(f"HTTP {e.code} {e.reason}")
+        raise PermanentFailure(f"HTTP {e.code} {e.reason}", status=e.code)
     raise RetryableFailure(f"HTTP {e.code} {e.reason}")
 
 
@@ -162,21 +171,57 @@ class DiscordDestination:
 
 
 class FeedDestination:
+    """Posts envelopes to the Worker, falling back to the v0 shape if needed.
+
+    The scanner and the Worker deploy independently, so for a while either can
+    be the older one. Rather than a config knob that has to be flipped in the
+    right order, this sends the envelope to /v1/ingest and drops back to the
+    rendered-line /ingest on a 404 — the one status that means "this Worker
+    does not know about v1 yet". The fallback sticks for the life of the
+    process, so it costs one wasted request, not one per event.
+    """
+
     kind = "feed"
 
     def __init__(self, feed_url, feed_token):
-        self.url = feed_url.rstrip("/") + "/ingest"
+        base = feed_url.rstrip("/")
+        self.v1_url = base + "/v1/ingest"
+        self.v0_url = base + "/ingest"
         self.token = feed_token or ""
+        self.use_v1 = True
+
+    def _headers(self):
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": "ScannerFeed/1.0"}
 
     def deliver(self, event):
-        # Still the v0 shape. The Worker learns the envelope in Phase 4; until
-        # then the structured event is rendered back down on the way out.
-        _post(self.url,
+        if self.use_v1:
+            try:
+                _post(self.v1_url, event, self._headers())
+                return
+            except PermanentFailure as e:
+                # Exactly 404, by status rather than by searching the message:
+                # a reason phrase can contain "404" too.
+                if e.status != 404:
+                    raise
+
+        # Either v1 said 404 or we have already fallen back.
+        _post(self.v0_url,
               {"line": event["render"]["plain"],
                "type": events.legacy_line_type(event)},
-              {"Content-Type": "application/json",
-               "Authorization": f"Bearer {self.token}",
-               "User-Agent": "ScannerFeed/1.0"})
+              self._headers())
+
+        # Only latch after v0 has actually worked. A misconfigured feed_url
+        # 404s for both paths, and latching on the v1 404 alone would print
+        # "your Worker is old", which is the wrong diagnosis, and then hide the
+        # real cause behind it for the life of the process.
+        if self.use_v1:
+            self.use_v1 = False
+            print(f"[warn] [feed] {self.v1_url} returned 404 but {self.v0_url} "
+                  f"accepted the event, so this Worker predates /v1/ingest. "
+                  f"Sending the v0 shape — deploy web/scanner-feed for "
+                  f"structured events.")
 
 
 # ---------------------------------------------------------------------------

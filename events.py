@@ -79,6 +79,10 @@ POLLER_RECOVERED = "poller.recovered"
 # ---------------------------------------------------------------------------
 TIER_PUBLIC = "public"
 TIER_SENSITIVE = "sensitive"
+# Kept in step with KNOWN_TIERS in web/scanner-feed/src/tier.js. The edge fails
+# closed on anything outside this set, so adding a tier means shipping the edge
+# before the producer that uses it.
+KNOWN_TIERS = frozenset({TIER_PUBLIC, TIER_SENSITIVE})
 
 # Event type -> the `type` field the v0 Worker feed expects. The web UI keys its
 # CSS and its label map off these, so they have to survive until /lines is
@@ -183,6 +187,13 @@ def envelope(event_type, data, group, stream=None, tier=TIER_PUBLIC,
              render_plain="", render_discord="", ts=None):
     """Build an event. `ts` defaults to now, and is passed in only when the
     producer already captured a more accurate time than the emit site."""
+    if tier not in KNOWN_TIERS:
+        # The edge rejects an unknown tier with a 400, which outputs.py treats
+        # as permanent — so a typo here would drop events silently rather than
+        # retrying them. Fail at the emit site, where the typo is.
+        raise ValueError(
+            "tier must be one of %s, not %r" % (", ".join(sorted(KNOWN_TIERS)), tier)
+        )
     return {
         "v": SCHEMA_VERSION,
         "id": new_ulid(),

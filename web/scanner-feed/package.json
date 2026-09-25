@@ -1,0 +1,13 @@
+{
+  "name": "scanner-feed",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "miniflare": "^3.20250718.3"
+  }
+}
