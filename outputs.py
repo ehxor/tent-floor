@@ -71,10 +71,12 @@ FAILURE_REWARN_S = 300
 # place to learn that a poller is wedged, and a poller failing upstream would
 # push a notice into it every five minutes. They are operator data — read them
 # with `python store.py --health`. Move them out of here if you would rather be
-# paged than have to look.
+# paged than have to look. Stream health is withheld for the same reasons.
 SUPPRESSED_TYPES = frozenset({events.WILDFIRE_REMOVED,
                               events.POLLER_ERROR,
-                              events.POLLER_RECOVERED})
+                              events.POLLER_RECOVERED,
+                              events.STREAM_ERROR,
+                              events.STREAM_RECOVERED})
 
 
 class PermanentFailure(Exception):

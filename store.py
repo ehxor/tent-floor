@@ -812,17 +812,33 @@ class Store:
 # ---------------------------------------------------------------------------
 # Kept as strings rather than importing events.py: this module is the bottom
 # of the stack and nothing else here needs that dependency.
-HEALTH_TYPES = ("poller.error", "poller.recovered")
+HEALTH_TYPES = ("poller.error", "poller.recovered",
+                "stream.error", "stream.recovered")
+_FAILING_TYPES = ("poller.error", "stream.error")
 
 
-def print_health(store, limit=20):
-    """Each poller's most recent health event.
+def _health_subject(event):
+    """(label, sort key) naming what a health event is about."""
+    data = event.get("data", {})
+    if event["type"].startswith("stream."):
+        stream, component = event.get("stream"), data.get("component")
+        return f"{stream} {component}", ("stream", stream or "", component or "")
+    poller, target = data.get("poller"), data.get("target")
+    label = f"{poller} {target}" if target else str(poller)
+    return label, ("poller", poller or "", target or "")
+
+
+def print_health(store, limit=20, history=False):
+    """Each poller's and stream's most recent health event.
 
     The log holds the history; this answers the only question worth asking
-    first, which is whether the thing is working right now. A poller with no
+    first, which is whether the thing is working right now. A subject with no
     row at all has either never failed or never started, and those are not
     the same — the row count is printed so an empty log reads as "nothing has
     been recorded" rather than "everything is fine".
+
+    `history` prints every scanned event newest first instead, which is what
+    you want when working out *why* a feed went quiet rather than whether it is.
     """
     rows = store.events.recent(types=HEALTH_TYPES, limit=limit)
     print(f"[store] {store.path}: {len(rows)} health event(s) "
@@ -832,20 +848,30 @@ def print_health(store, limit=20):
         print("  none recorded")
         return
 
+    if history:
+        for _, event in rows:
+            label, _key = _health_subject(event)
+            if event.get("group"):
+                label += f" [{event['group']}]"
+            print(f"  {event['ts']}  {label}")
+            print(f"      {event['render']['plain']}")
+            for line in event.get("data", {}).get("stderr") or ():
+                print(f"        | {line}")
+        return
+
     latest = {}
     for _, event in rows:          # newest first, so the first wins
-        data = event.get("data", {})
-        key = (data.get("poller"), data.get("target"), event.get("group"))
-        latest.setdefault(key, event)
+        label, key = _health_subject(event)
+        latest.setdefault(key + (event.get("group") or "",), (label, event))
 
-    for (poller, target, group), event in sorted(
-            latest.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
-        label = f"{poller} {target}" if target else str(poller)
-        if group:
-            label += f" [{group}]"
-        state = "FAILING" if event["type"] == "poller.error" else "ok"
+    for _key, (label, event) in sorted(latest.items()):
+        if event.get("group"):
+            label += f" [{event['group']}]"
+        state = "FAILING" if event["type"] in _FAILING_TYPES else "ok"
         print(f"  {label:36} {state}")
         print(f"      {event['ts']}  {event['render']['plain']}")
+        for line in event.get("data", {}).get("stderr") or ():
+            print(f"        | {line}")
 
 
 def main():
@@ -857,7 +883,11 @@ def main():
                         help="Run the retention sweep and exit")
     parser.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
     parser.add_argument("--health", action="store_true",
-                        help="Show each poller's latest health event and exit")
+                        help="Show each poller's and stream's latest health "
+                             "event and exit")
+    parser.add_argument("--history", action="store_true",
+                        help="With --health, list every health event newest "
+                             "first instead of only the latest per subject")
     parser.add_argument("--health-limit", type=int, default=20,
                         help="How many health events to scan back through")
     args = parser.parse_args()
@@ -865,7 +895,7 @@ def main():
     store = Store(args.db, retention_days=args.retention_days)
 
     if args.health:
-        print_health(store, limit=args.health_limit)
+        print_health(store, limit=args.health_limit, history=args.history)
         return
 
     if args.sweep:

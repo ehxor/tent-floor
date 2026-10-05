@@ -243,7 +243,8 @@ That runs one poll of each source, records the results, and announces nothing. T
 
 ```bash
 python store.py --db tentfloor.db            # row counts per table
-python store.py --db tentfloor.db --health   # is each poller reaching its API?
+python store.py --db tentfloor.db --health   # is each poller and stream working?
+python store.py --db tentfloor.db --health --history --health-limit 100  # and what happened
 python store.py --db tentfloor.db --sweep    # force a retention sweep
 
 sqlite3 tentfloor.db \
@@ -268,6 +269,27 @@ than have to look.
 sqlite3 tentfloor.db \
   "SELECT ts, json_extract(body,'$.data.kind'), json_extract(body,'$.data.consecutive')
      FROM events WHERE type = 'poller.error' ORDER BY seq DESC LIMIT 10"
+```
+
+### Stream health
+
+Each audio stream records `stream.error` and `stream.recovered` with the same
+policy, one run per stage, named by `data.component`:
+
+| component    | covers                                                         | kinds                                                                                       |
+|--------------|----------------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| `audio`      | ffmpeg and the reader — every watchdog restart and why          | `ffmpeg_exit`, `stalled`, `eof`, `startup_failed`, `stale`, `read_error`, `thread_error`, `watchdog_error` |
+| `queue`      | handing a transmission to whisper                              | `queue_full` (the GPU is falling behind and audio is being dropped)                          |
+| `transcribe` | whisper itself                                                 | `whisper_exit`, `whisper_timeout`                                                           |
+
+`audio` errors carry the last lines ffmpeg wrote (`data.stderr`), its exit code,
+how long it had been up and how long since it last produced audio. `--health`
+prints the stderr lines under each entry.
+
+```bash
+sqlite3 tentfloor.db \
+  "SELECT ts, stream, json_extract(body,'$.data.component'), json_extract(body,'$.data.detail')
+     FROM events WHERE type LIKE 'stream.%' ORDER BY seq DESC LIMIT 20"
 ```
 
 Pass `--no-store` (or set `store.enabled` to `false`) to run without it. Change detection then falls back to memory and restarts re-announce everything — the pre-store behaviour.

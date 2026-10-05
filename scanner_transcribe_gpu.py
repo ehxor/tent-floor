@@ -39,6 +39,7 @@ import os
 import select
 import base64
 import urllib.request
+from collections import deque
 import numpy as np
 from pathlib import Path
 from urllib.parse import urlparse
@@ -252,7 +253,8 @@ def pcm_to_wav_bytes(audio_np):
     return bytes(buf)
 
 
-def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=BEAM_SIZE):
+def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=BEAM_SIZE,
+                     on_error=None):
     """Returns the transcript, "" when there was nothing transcribable, or None
     when whisper itself failed.
 
@@ -260,6 +262,9 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
     audio is not worth keeping, while "whisper crashed or hung" means it is
     exactly the audio worth keeping. Collapsing both to "" deletes the clip in
     the case the clip exists for.
+
+    `on_error(kind, detail)` is called before returning None, so the caller can
+    record why rather than only that.
     """
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     try:
@@ -272,6 +277,12 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             print(f"[debug] whisper failed (code {result.returncode}): {result.stderr.strip()}")
+            if on_error is not None:
+                # whisper's stderr is mostly model-loading chatter; the cause is
+                # at the end.
+                tail = result.stderr.strip().splitlines()[-5:]
+                on_error("whisper_exit",
+                         f"whisper exited {result.returncode}: " + " | ".join(tail))
             return None
         lines = []
         for line in result.stdout.splitlines():
@@ -288,6 +299,8 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
         return " ".join(lines)
     except subprocess.TimeoutExpired:
         print(f"[debug] whisper timeout (>60s)")
+        if on_error is not None:
+            on_error("whisper_timeout", "whisper did not finish within 60s")
         return None
     finally:
         os.unlink(tmp.name)
@@ -296,20 +309,62 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
 # ===================================================================
 # FFmpeg + transmission-aware chunking
 # ===================================================================
-def log_ffmpeg_stderr(stream_name, proc, prefix=""):
-    """Log any stderr output from ffmpeg for debugging."""
+# Lines of ffmpeg stderr kept per process. ffmpeg runs at -loglevel warning, so
+# this is the reconnect attempts and HTTP errors leading up to a failure.
+FFMPEG_STDERR_TAIL = 20
+
+
+class StderrTail:
+    """The last lines a process wrote. Appended by its drain thread and read
+    by the watchdog, so both go through the lock — copying a deque while it is
+    appended to raises."""
+
+    def __init__(self, maxlen=FFMPEG_STDERR_TAIL):
+        self._lines = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def append(self, line):
+        with self._lock:
+            self._lines.append(line)
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._lines)
+
+
+def _drain_stderr(proc, tail):
+    """Read ffmpeg's stderr for the life of the process, keeping the tail.
+
+    Nothing used to read this pipe until something had already gone wrong, and
+    then it was read with a blocking read-to-EOF on a process that was still
+    running — which never returns, and the watchdog made that call holding
+    managed_lock. Unread, the pipe also fills after ~64 KB of reconnect
+    warnings and ffmpeg blocks writing to it, which looks exactly like a stall.
+    """
     try:
-        # Non-blocking read of stderr
-        stderr = proc.stderr.read()
-        if stderr:
-            stderr_text = stderr.decode('utf-8', errors='replace').strip()
-            if stderr_text:
-                # Limit output to avoid log spam
-                lines = stderr_text.splitlines()[:5]
-                for line in lines:
-                    print(f"[{format_timestamp()}] [{stream_name}] {prefix}ffmpeg: {line}")
-    except Exception:
-        pass
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                tail.append(f"{format_timestamp()} {line}")
+    except (ValueError, OSError):
+        pass                    # pipe closed under us; the process is gone
+    finally:
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+
+
+def ffmpeg_stderr_tail(proc):
+    """The last lines ffmpeg wrote, oldest first. Never blocks on ffmpeg."""
+    tail = getattr(proc, "stderr_tail", None)
+    return tail.snapshot() if tail is not None else []
+
+
+def log_ffmpeg_stderr(stream_name, proc, prefix=""):
+    """Print the last few lines ffmpeg wrote, for the terminal."""
+    for line in ffmpeg_stderr_tail(proc)[-5:]:
+        print(f"[{format_timestamp()}] [{stream_name}] {prefix}ffmpeg: {line}")
 
 
 FFMPEG_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -354,7 +409,11 @@ def start_ffmpeg(stream_url):
             cmd += ["-headers", header]
     cmd += ["-i", stream_url, "-f", "s16le", "-acodec", "pcm_s16le",
             "-ar", str(SAMPLE_RATE), "-ac", "1", "-"]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stderr_tail = StderrTail()
+    threading.Thread(target=_drain_stderr, args=(proc, proc.stderr_tail),
+                     daemon=True).start()
+    return proc
 
 
 # Global stream activity tracking (thread-safe)
@@ -374,7 +433,21 @@ def get_stream_activity(stream_name):
         return stream_activity.get(stream_name, 0)
 
 
-def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug_vad=False):
+def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug_vad=False,
+                         status=None, queue_health=None):
+    """Read PCM from ffmpeg and cut it into transmissions.
+
+    `status` is a dict this thread writes its exit reason into, as
+    status["exit"] = (kind, detail). The watchdog notices the thread is gone and
+    records that reason, which is the only place it survives — the thread
+    itself cannot restart anything.
+    """
+    if status is None:
+        status = {}
+
+    def exited(kind, detail):
+        status.setdefault("exit", (kind, detail))
+
     mini_chunk_samples = int(SAMPLE_RATE * MINI_CHUNK_MS / 1000)
     mini_chunk_bytes = mini_chunk_samples * 2
     silence_split_chunks = int(SILENCE_TO_SPLIT_MS / MINI_CHUNK_MS)
@@ -398,6 +471,7 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
             except (ValueError, OSError) as e:
                 # File descriptor invalid (process died)
                 print(f"[{format_timestamp()}] [{stream_name}] SELECT ERROR: {type(e).__name__}: {e}")
+                exited("select_error", f"select() failed: {type(e).__name__}: {e}")
                 break
 
             if not ready:
@@ -410,10 +484,13 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
                 if ffmpeg_proc.poll() is not None:
                     print(f"[{format_timestamp()}] [{stream_name}] FFmpeg process died (exit code: {ffmpeg_proc.returncode})")
                     log_ffmpeg_stderr(stream_name, ffmpeg_proc, "on death: ")
+                    exited("ffmpeg_exit", f"ffmpeg exited with code {ffmpeg_proc.returncode}")
                     break
                 
                 if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                     print(f"[{format_timestamp()}] [{stream_name}] STALLED: no data for {MAX_CONSECUTIVE_TIMEOUTS * READ_TIMEOUT_S:.0f}s")
+                    exited("stalled", f"ffmpeg running but no audio for "
+                                      f"{MAX_CONSECUTIVE_TIMEOUTS * READ_TIMEOUT_S:.0f}s")
                     break
                 continue
 
@@ -424,10 +501,12 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
                 data = ffmpeg_proc.stdout.read(mini_chunk_bytes)
             except Exception as e:
                 print(f"[{format_timestamp()}] [{stream_name}] READ ERROR: {type(e).__name__}: {e}")
+                exited("read_error", f"reading ffmpeg output failed: {type(e).__name__}: {e}")
                 break
 
             if not data:
                 print(f"[{format_timestamp()}] [{stream_name}] EOF: stdout closed")
+                exited("eof", "ffmpeg closed its output")
                 break
             if len(data) < mini_chunk_bytes:
                 print(f"[{format_timestamp()}] [{stream_name}] PARTIAL READ: {len(data)}/{mini_chunk_bytes} bytes")
@@ -454,7 +533,8 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
                     transmission_buf.append(audio_np)
                     silence_count = 0
                     if len(transmission_buf) >= max_chunks:
-                        _emit_transmission(stream_name, transmission_buf, work_queue, min_chunks)
+                        _emit_transmission(stream_name, transmission_buf, work_queue, min_chunks,
+                                           queue_health)
                         transmission_buf = []
                         in_transmission = False
                 else:
@@ -462,7 +542,8 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
                         silence_count += 1
                         transmission_buf.append(audio_np)
                         if silence_count >= silence_split_chunks:
-                            _emit_transmission(stream_name, transmission_buf, work_queue, min_chunks)
+                            _emit_transmission(stream_name, transmission_buf, work_queue, min_chunks,
+                                               queue_health)
                             transmission_buf = []
                             silence_count = 0
                             in_transmission = False
@@ -472,9 +553,11 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
                             pre_speech_ring.pop(0)
 
         if transmission_buf:
-            _emit_transmission(stream_name, transmission_buf, work_queue, min_chunks)
+            _emit_transmission(stream_name, transmission_buf, work_queue, min_chunks,
+                               queue_health)
     except Exception as e:
         print(f"[{format_timestamp()}] [{stream_name}] THREAD ERROR: {type(e).__name__}: {e}")
+        exited("thread_error", f"reader crashed: {type(e).__name__}: {e}")
     finally:
         print(f"[{format_timestamp()}] [{stream_name}] THREAD END")
         try:
@@ -483,7 +566,7 @@ def stream_reader_thread(stream_name, ffmpeg_proc, work_queue, stop_event, debug
             print(f"[{format_timestamp()}] [{stream_name}] QUEUE FULL on shutdown signal")
 
 
-def _emit_transmission(stream_name, mini_chunks, work_queue, min_chunks):
+def _emit_transmission(stream_name, mini_chunks, work_queue, min_chunks, health=None):
     if len(mini_chunks) < min_chunks:
         return
     try:
@@ -492,8 +575,19 @@ def _emit_transmission(stream_name, mini_chunks, work_queue, min_chunks):
         work_queue.put((stream_name, pcm_bytes), timeout=5)
     except queue.Full:
         print(f"[{format_timestamp()}] [{stream_name}] QUEUE FULL: dropping transmission")
+        if health is not None:
+            health.failed("queue_full",
+                          f"transcription queue full ({work_queue.maxsize}); "
+                          f"dropped a {len(mini_chunks) * MINI_CHUNK_MS / 1000:.1f}s "
+                          f"transmission")
+        return
     except Exception as e:
         print(f"[{format_timestamp()}] [{stream_name}] EMIT ERROR: {type(e).__name__}: {e}")
+        if health is not None:
+            health.failed("emit_error", f"{type(e).__name__}: {e}")
+        return
+    if health is not None:
+        health.ok()
 
 
 # ===================================================================
@@ -1220,14 +1314,31 @@ def main():
     if store is not None or clip_store is not None:
         threading.Thread(target=maintenance_loop, daemon=True).start()
 
+    # --- Stream health ---
+    # Everything that can stop a feed transcribing while the stream itself is
+    # fine online — ffmpeg dying or stalling, the watchdog restarting it, the
+    # transcription queue overflowing, whisper failing — is recorded to the
+    # event log here, not just printed. Read it back with
+    # `python store.py --health` (or `--health --history`).
+    stream_health = {}
+    for s in all_streams:
+        emit = groups[s["group"]]["outputs"].emit
+        stream_health[s["name"]] = {
+            component: events.StreamHealth(s["name"], component,
+                                           group=s["group"], emit=emit)
+            for component in events.STREAM_COMPONENTS
+        }
+
     managed_streams = []
     managed_lock = threading.Lock()
 
     def start_one_stream(stream_def):
         proc = start_ffmpeg(stream_def["url"])
+        status = {}
         reader = threading.Thread(
             target=stream_reader_thread,
-            args=(stream_def["name"], proc, work_queue, stop_event, args.debug_vad),
+            args=(stream_def["name"], proc, work_queue, stop_event, args.debug_vad,
+                  status, stream_health[stream_def["name"]]["queue"]),
             daemon=True)
         reader.start()
         return {
@@ -1235,6 +1346,7 @@ def main():
             "url": stream_def["url"],
             "proc": proc,
             "reader": reader,
+            "status": status,
             "started_at": time.monotonic(),
             "startup_verified": False,  # New field for startup verification
         }
@@ -1258,17 +1370,17 @@ def main():
     print("=" * 60)
 
     def kill_ffmpeg(proc):
-        """Aggressively kill an FFmpeg process and close its pipes."""
+        """Aggressively kill an FFmpeg process and close its pipes.
+
+        stderr is left to its drain thread, which closes it at EOF. Closing it
+        here would contend with that thread's readline for the buffer lock.
+        """
         try:
             proc.terminate()
         except Exception:
             pass
         try:
             proc.stdout.close()  # Unblocks the reader thread's read() call
-        except Exception:
-            pass
-        try:
-            proc.stderr.close()
         except Exception:
             pass
         try:
@@ -1280,6 +1392,85 @@ def main():
             except Exception:
                 pass
 
+    def record_restart(ms, kind, detail):
+        """Record why a stream is being restarted, with ffmpeg's last words."""
+        now = time.monotonic()
+        last = get_stream_activity(ms["name"])
+        event = stream_health[ms["name"]]["audio"].failed(kind, detail, context={
+            "stderr": ffmpeg_stderr_tail(ms["proc"]),
+            "exit_code": ms["proc"].poll(),
+            "uptime_s": round(now - ms["started_at"], 1),
+            "last_audio_s_ago": round(now - last, 1) if last else None,
+        })
+        if event is not None:
+            print(f"[{format_timestamp()}] [health] {event['render']['plain']}")
+
+    def check_stream(i, ms, now):
+        """One stream's watchdog pass. Returns the entry to keep in its slot."""
+        # Check if thread died
+        if not ms["reader"].is_alive():
+            kind, detail = ms["status"].get(
+                "exit", ("reader_died", "reader thread ended without a reason"))
+            print(f"[{format_timestamp()}] [stream] {ms['name']} reader thread died "
+                  f"({detail}), restarting...")
+            log_ffmpeg_stderr(ms['name'], ms["proc"], "before restart: ")
+            record_restart(ms, kind, detail)
+            kill_ffmpeg(ms["proc"])
+            return start_one_stream(all_streams[i])
+
+        age = now - ms["started_at"]
+
+        # Check if ffmpeg process died
+        if ms["proc"].poll() is not None:
+            print(f"[{format_timestamp()}] [stream] {ms['name']} ffmpeg died (exit: {ms['proc'].returncode}), restarting...")
+            log_ffmpeg_stderr(ms['name'], ms["proc"])
+            record_restart(ms, "ffmpeg_exit",
+                           f"ffmpeg exited with code {ms['proc'].returncode}")
+            kill_ffmpeg(ms["proc"])
+            return start_one_stream(all_streams[i])
+
+        # Check for startup verification (stream must produce data within grace period)
+        if not ms["startup_verified"]:
+            last_activity = get_stream_activity(ms["name"])
+            time_since_start = now - ms["started_at"]
+            time_since_data = now - last_activity
+
+            if time_since_start > STARTUP_GRACE_PERIOD_S and time_since_data > STARTUP_GRACE_PERIOD_S:
+                print(f"[{format_timestamp()}] [stream] {ms['name']} STARTUP FAILED: no data after {time_since_start:.0f}s")
+                log_ffmpeg_stderr(ms['name'], ms["proc"], "startup failed: ")
+                record_restart(ms, "startup_failed",
+                               f"no audio within {time_since_start:.0f}s of connecting")
+                kill_ffmpeg(ms["proc"])
+                return start_one_stream(all_streams[i])
+            elif time_since_data < STARTUP_GRACE_PERIOD_S:
+                # Stream has produced data recently, mark as verified
+                ms["startup_verified"] = True
+                recovered = stream_health[ms["name"]]["audio"].ok()
+                if recovered is not None:
+                    print(f"[{format_timestamp()}] [health] {recovered['render']['plain']}")
+
+        # Steady-state liveness check: restart if no data for too long
+        if ms["startup_verified"]:
+            last_activity = get_stream_activity(ms["name"])
+            time_since_data = now - last_activity
+            if time_since_data > STREAM_LIVENESS_TIMEOUT_S:
+                print(f"[{format_timestamp()}] [stream] {ms['name']} STALE: no audio for {time_since_data:.0f}s, restarting...")
+                log_ffmpeg_stderr(ms['name'], ms["proc"], "stale stream: ")
+                record_restart(ms, "stale", f"no audio for {time_since_data:.0f}s")
+                kill_ffmpeg(ms["proc"])
+                return start_one_stream(all_streams[i])
+
+        # Scheduled restart
+        if age >= STREAM_RESTART_S:
+            print(f"[{format_timestamp()}] [stream] {ms['name']} "
+                  f"scheduled restart ({age / 3600:.1f}h)")
+            old_proc = ms["proc"]
+            replacement = start_one_stream(all_streams[i])
+            kill_ffmpeg(old_proc)
+            return replacement
+
+        return ms
+
     # Enhanced Watchdog with startup verification
     def stream_watchdog():
         while not stop_event.is_set():
@@ -1289,57 +1480,19 @@ def main():
             now = time.monotonic()
             with managed_lock:
                 for i, ms in enumerate(managed_streams):
-                    # Check if thread died
-                    if not ms["reader"].is_alive():
-                        print(f"[{format_timestamp()}] [stream] {ms['name']} reader thread died, restarting...")
-                        log_ffmpeg_stderr(ms['name'], ms["proc"], "before restart: ")
-                        kill_ffmpeg(ms["proc"])
-                        managed_streams[i] = start_one_stream(all_streams[i])
-                        continue
-                    
-                    age = now - ms["started_at"]
-                    
-                    # Check if ffmpeg process died
-                    if ms["proc"].poll() is not None:
-                        print(f"[{format_timestamp()}] [stream] {ms['name']} ffmpeg died (exit: {ms['proc'].returncode}), restarting...")
-                        log_ffmpeg_stderr(ms['name'], ms["proc"])
-                        managed_streams[i] = start_one_stream(all_streams[i])
-                        continue
-                    
-                    # Check for startup verification (stream must produce data within grace period)
-                    if not ms["startup_verified"]:
-                        last_activity = get_stream_activity(ms["name"])
-                        time_since_start = now - ms["started_at"]
-                        time_since_data = now - last_activity
-                        
-                        if time_since_start > STARTUP_GRACE_PERIOD_S and time_since_data > STARTUP_GRACE_PERIOD_S:
-                            print(f"[{format_timestamp()}] [stream] {ms['name']} STARTUP FAILED: no data after {time_since_start:.0f}s")
-                            log_ffmpeg_stderr(ms['name'], ms["proc"], "startup failed: ")
-                            kill_ffmpeg(ms["proc"])
-                            managed_streams[i] = start_one_stream(all_streams[i])
-                            continue
-                        elif time_since_data < STARTUP_GRACE_PERIOD_S:
-                            # Stream has produced data recently, mark as verified
-                            ms["startup_verified"] = True
-                    
-                    # Steady-state liveness check: restart if no data for too long
-                    if ms["startup_verified"]:
-                        last_activity = get_stream_activity(ms["name"])
-                        time_since_data = now - last_activity
-                        if time_since_data > STREAM_LIVENESS_TIMEOUT_S:
-                            print(f"[{format_timestamp()}] [stream] {ms['name']} STALE: no audio for {time_since_data:.0f}s, restarting...")
-                            log_ffmpeg_stderr(ms['name'], ms["proc"], "stale stream: ")
-                            kill_ffmpeg(ms["proc"])
-                            managed_streams[i] = start_one_stream(all_streams[i])
-                            continue
-                    
-                    # Scheduled restart
-                    if age >= STREAM_RESTART_S:
+                    # An exception here used to end the watchdog thread, after
+                    # which no stream was ever restarted again — one feed goes
+                    # quiet and stays quiet. Contain it to this stream and pass.
+                    try:
+                        managed_streams[i] = check_stream(i, ms, now)
+                    except Exception as e:
                         print(f"[{format_timestamp()}] [stream] {ms['name']} "
-                              f"scheduled restart ({age / 3600:.1f}h)")
-                        old_proc = ms["proc"]
-                        managed_streams[i] = start_one_stream(all_streams[i])
-                        kill_ffmpeg(old_proc)
+                              f"watchdog error: {type(e).__name__}: {e}")
+                        try:
+                            stream_health[ms["name"]]["audio"].failed(
+                                "watchdog_error", f"{type(e).__name__}: {e}")
+                        except Exception:
+                            pass
 
     threading.Thread(target=stream_watchdog, daemon=True).start()
 
@@ -1436,12 +1589,26 @@ def main():
                                         duration_s=duration)
 
             prompt = stream_jargon.get(stream_name)
+            whisper_error = []
             with transcribe_lock:
                 t0 = time.monotonic()
                 wav_bytes = pcm_to_wav_bytes(audio_np)
                 text = transcribe_chunk(whisper_bin, model_path, wav_bytes,
-                                         prompt=prompt, beam_size=BEAM_SIZE)
+                                         prompt=prompt, beam_size=BEAM_SIZE,
+                                         on_error=lambda k, d: whisper_error.append((k, d)))
                 elapsed = time.monotonic() - t0
+
+            transcribe_health = stream_health.get(stream_name, {}).get("transcribe")
+            if transcribe_health is not None:
+                if text is None:
+                    kind, detail = (whisper_error[0] if whisper_error
+                                    else ("whisper_failed", "transcription failed"))
+                    transcribe_health.failed(kind, detail, context={
+                        "audio_s": round(duration, 2),
+                        "clip": clip["id"] if clip else None,
+                    })
+                else:
+                    transcribe_health.ok()
 
             if text:
                 print(f"[{format_timestamp()}] {color}{stream_name}{reset} "

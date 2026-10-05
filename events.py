@@ -65,6 +65,19 @@ WILDFIRE_REMOVED = "wildfire.removed"
 POLLER_ERROR = "poller.error"
 POLLER_RECOVERED = "poller.recovered"
 
+# The same for an audio stream. A feed that stops transcribing while the stream
+# itself still plays online had the same problem: ffmpeg's stderr, the watchdog's
+# restarts and whisper's failures all went to a terminal, so coming back days
+# later left nothing to work out which of them it was. `data.component` says
+# which stage failed — see STREAM_COMPONENTS.
+STREAM_ERROR = "stream.error"
+STREAM_RECOVERED = "stream.recovered"
+
+# audio:      ffmpeg and the reader thread — connecting, stalls, exits, restarts.
+# queue:      handing a finished transmission to the transcriber.
+# transcribe: whisper itself.
+STREAM_COMPONENTS = ("audio", "queue", "transcribe")
+
 # ---------------------------------------------------------------------------
 # Tiers
 #
@@ -320,10 +333,10 @@ def _duration(seconds):
     return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
 
 
-class PollerHealth:
-    """Turns a poller's per-poll outcome into a few durable events.
+class Health:
+    """Turns a component's per-attempt outcome into a few durable events.
 
-    The policy between "one row per failed poll" and "one row and then
+    The policy between "one row per failed attempt" and "one row and then
     silence forever":
 
       * the first failure of a run is recorded immediately,
@@ -333,19 +346,27 @@ class PollerHealth:
       * an unchanged failure is re-recorded every `rewarn_s`, so a long
         outage leaves a trail with a length instead of a single old row,
       * the first success after a run records how long the outage lasted
-        and how many polls it swallowed.
+        and how many attempts it swallowed.
 
     `emit` takes a callable rather than a store.EventLog so this module stays
     stdlib-only and store.py keeps not importing it. Pass `log.append`.
 
-    Not thread-safe: one instance belongs to one poller thread.
+    Subclasses name the event types and the identity fields that say *what*
+    is failing; those fields lead every event's `data`.
+
+    Thread-safe: a stream is reported on from its reader thread, the watchdog
+    and the transcription loop.
     """
 
-    def __init__(self, poller, target=None, group=None, emit=None,
+    error_type = None
+    recovered_type = None
+
+    def __init__(self, identity, label, group=None, stream=None, emit=None,
                  rewarn_s=HEALTH_REWARN_S, clock=time.monotonic):
-        self.poller = poller
-        self.target = target
+        self.identity = identity
+        self.label = label
         self.group = group
+        self.stream = stream
         self.emit = emit
         self.rewarn_s = rewarn_s
         self.clock = clock
@@ -355,88 +376,124 @@ class PollerHealth:
         self.since = None           # RFC3339 of the run's first failure
         self._since_mono = None
         self._last_report_mono = None
+        self._lock = threading.Lock()
 
     @property
     def failing(self):
         return self.kind is not None
-
-    def _label(self):
-        return f"{self.poller} {self.target}" if self.target else self.poller
 
     def _publish(self, event):
         if self.emit is not None:
             self.emit(event)
         return event
 
-    def failed(self, kind, detail, retryable=True):
-        """Record one failed poll. Returns the event if one was emitted.
+    def failed(self, kind, detail, retryable=True, context=None):
+        """Record one failed attempt. Returns the event if one was emitted.
 
         Returns None when the failure was folded into the open run, which is
         the common case — the caller should treat None as "already known",
         not as "nothing happened".
+
+        `context` is merged into the event's data — evidence that only exists
+        at the moment of failure, such as the last lines ffmpeg wrote.
         """
-        now = self.clock()
-        if kind != self.kind:
-            self.kind = kind
-            self.consecutive = 0
-            self.since = utc_now()
-            self._since_mono = now
-            self._last_report_mono = None
-        self.detail = detail
-        self.consecutive += 1
+        with self._lock:
+            now = self.clock()
+            if kind != self.kind:
+                self.kind = kind
+                self.consecutive = 0
+                self.since = utc_now()
+                self._since_mono = now
+                self._last_report_mono = None
+            self.detail = detail
+            self.consecutive += 1
 
-        if (self._last_report_mono is not None
-                and now - self._last_report_mono < self.rewarn_s):
-            return None
-        self._last_report_mono = now
+            if (self._last_report_mono is not None
+                    and now - self._last_report_mono < self.rewarn_s):
+                return None
+            self._last_report_mono = now
 
-        elapsed = now - self._since_mono
-        label = self._label()
-        if self.consecutive == 1:
-            plain = f"⚠️  {label}: {detail}"
-        else:
-            plain = (f"⚠️  {label}: {detail} "
-                     f"(×{self.consecutive} over {_duration(elapsed)})")
-        return self._publish(envelope(
-            POLLER_ERROR,
-            {
-                "poller": self.poller,
-                "target": self.target,
+            elapsed = now - self._since_mono
+            if self.consecutive == 1:
+                plain = f"⚠️  {self.label}: {detail}"
+            else:
+                plain = (f"⚠️  {self.label}: {detail} "
+                         f"(×{self.consecutive} over {_duration(elapsed)})")
+            data = dict(self.identity)
+            data.update({
                 "kind": kind,
                 "detail": detail,
                 "retryable": retryable,
                 "consecutive": self.consecutive,
                 "since": self.since,
                 "failing_for_s": round(elapsed, 3),
-            },
-            self.group, tier=TIER_SENSITIVE,
-            render_plain=plain, render_discord=plain,
-        ))
+            })
+            if context:
+                data.update(context)
+            event = envelope(
+                self.error_type, data, self.group, stream=self.stream,
+                tier=TIER_SENSITIVE, render_plain=plain, render_discord=plain)
+        return self._publish(event)
 
     def ok(self):
-        """Record a successful poll. Returns a recovery event, or None if the
-        poller was already healthy."""
-        if self.kind is None:
-            return None
+        """Record a success. Returns a recovery event, or None if the
+        component was already healthy."""
+        with self._lock:
+            if self.kind is None:
+                return None
 
-        elapsed = self.clock() - self._since_mono
-        kind, consecutive, since = self.kind, self.consecutive, self.since
-        self.kind = self.detail = self.since = None
-        self._since_mono = self._last_report_mono = None
-        self.consecutive = 0
+            elapsed = self.clock() - self._since_mono
+            kind, consecutive, since = self.kind, self.consecutive, self.since
+            self.kind = self.detail = self.since = None
+            self._since_mono = self._last_report_mono = None
+            self.consecutive = 0
 
-        plain = (f"✅ {self._label()}: recovered after {consecutive} failed "
-                 f"poll(s) over {_duration(elapsed)} ({kind})")
-        return self._publish(envelope(
-            POLLER_RECOVERED,
-            {
-                "poller": self.poller,
-                "target": self.target,
+            plain = (f"✅ {self.label}: recovered after {consecutive} "
+                     f"failure(s) over {_duration(elapsed)} ({kind})")
+            data = dict(self.identity)
+            data.update({
                 "kind": kind,
                 "consecutive": consecutive,
                 "since": since,
                 "outage_s": round(elapsed, 3),
-            },
-            self.group, tier=TIER_SENSITIVE,
-            render_plain=plain, render_discord=plain,
-        ))
+            })
+            event = envelope(
+                self.recovered_type, data, self.group, stream=self.stream,
+                tier=TIER_SENSITIVE, render_plain=plain, render_discord=plain)
+        return self._publish(event)
+
+
+class PollerHealth(Health):
+    """Health of one poller against one upstream target."""
+
+    error_type = POLLER_ERROR
+    recovered_type = POLLER_RECOVERED
+
+    def __init__(self, poller, target=None, group=None, emit=None,
+                 rewarn_s=HEALTH_REWARN_S, clock=time.monotonic):
+        self.poller = poller
+        self.target = target
+        label = f"{poller} {target}" if target else poller
+        super().__init__({"poller": poller, "target": target}, label,
+                         group=group, emit=emit, rewarn_s=rewarn_s, clock=clock)
+
+
+class StreamHealth(Health):
+    """Health of one stage of one audio stream's path to a transcript.
+
+    One instance per (stream, component), so an ffmpeg that keeps dying and a
+    whisper that keeps timing out are separate runs with separate recoveries
+    rather than one interrupting the other.
+    """
+
+    error_type = STREAM_ERROR
+    recovered_type = STREAM_RECOVERED
+
+    def __init__(self, stream, component, group=None, emit=None,
+                 rewarn_s=HEALTH_REWARN_S, clock=time.monotonic):
+        if component not in STREAM_COMPONENTS:
+            raise ValueError(f"unknown stream component: {component!r}")
+        self.component = component
+        super().__init__({"component": component}, f"{stream} {component}",
+                         group=group, stream=stream, emit=emit,
+                         rewarn_s=rewarn_s, clock=clock)
