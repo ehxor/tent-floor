@@ -304,6 +304,38 @@ A process that is killed outright (`kill -9`, power loss) records nothing, so a
 `process.started` that follows another with no `process.exited` between them
 means exactly that.
 
+### Monitoring: `/healthz`
+
+`admin_ui.py` serves `GET /healthz`: `200` when the scanner is working, `503`
+when it is not, with a JSON body whose `problems` say why. It lives in the
+admin UI rather than the scanner so that it still answers when the scanner
+process is gone. It reads:
+
+- **the heartbeat** — a `kv` row (`health/heartbeat`) the scanner rewrites every
+  30s, carrying its pid, start time, queue depth and when the transcription
+  loop last came round. Three missed beats means the process is gone (with its
+  recorded exit reason, if it left one); a fresh beat with a loop older than
+  3 minutes means the loop is stuck.
+- **health events since that process started** — any stream stage or poller in
+  an open failure run older than 2 minutes. Younger ones are listed under
+  `pending` without failing the check, so one PulsePoint timeout does not page.
+- **transcripts** — any stream with none for longer than its
+  `silence_alert_minutes` (default 240). This is the failure where ffmpeg is
+  fine and nothing is transcribed. Set it per stream, above that feed's longest
+  normal overnight lull:
+
+  ```json
+  {"name": "Kamloops", "url": "...", "silence_alert_minutes": 150}
+  ```
+
+The body carries no transcript text. With `--token`, pass it as
+`Authorization: Bearer <token>` (or `?token=`, which ends up in logs).
+
+For Uptime Kuma: an **HTTP(s)** monitor on `http://<host>:8842/healthz`, the
+token as a Bearer header, accepted status codes `200-299`, a 60s interval and a
+couple of retries. Run Kuma on a different machine and the same monitor also
+catches this machine or its network going down.
+
 Pass `--no-store` (or set `store.enabled` to `false`) to run without it. Change detection then falls back to memory and restarts re-announce everything — the pre-store behaviour.
 
 ### PulsePoint and AWS WAF

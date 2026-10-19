@@ -34,6 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import events
+import healthcheck
 
 DEFAULT_HOST = "127.0.0.1"
 # Above 1024: binding a privileged port would need root, which is the last thing
@@ -356,6 +357,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"streams": self.library.streams()})
             elif route == "/api/stats":
                 self._send_json(self.library.stats())
+            elif route == "/healthz":
+                # For a monitor (Uptime Kuma and the like): the status code is
+                # the answer and the body says why. No transcript text.
+                report = healthcheck.evaluate(self.library.connect())
+                self._send_json(report, status=200 if report["status"] == "ok" else 503)
             elif route == "/api/hallucinations":
                 self._send_json({"count": len(self.hallucinations.phrases()),
                                  "read_only": self.read_only})

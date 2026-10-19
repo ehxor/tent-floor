@@ -403,6 +403,33 @@ class Routes(ServerFixture, unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "no-store")
 
 
+class Healthz(ServerFixture, unittest.TestCase):
+    """The status code is what a monitor reads, so it is checked over HTTP."""
+
+    def test_no_heartbeat_is_503_with_the_reason(self):
+        store = Store(str(self.db))
+        try:
+            store.kv.delete("health", "heartbeat")
+        finally:
+            store.close()
+        status, headers, body = self.get("/healthz")
+        self.assertEqual(status, 503)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertIn("no scanner heartbeat", json.loads(body)["problems"][0])
+
+    def test_a_live_scanner_is_200(self):
+        store = Store(str(self.db))
+        try:
+            store.kv.set("health", "heartbeat", {
+                "pid": 1, "started_at": events.utc_now(), "interval_s": 30,
+                "loop_at": time.time(), "streams": []})
+        finally:
+            store.close()
+        status, _, body = self.get("/healthz")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["status"], "ok")
+
+
 class TokenAuth(unittest.TestCase):
     """Only enforced off localhost, but the mechanism has to work."""
 

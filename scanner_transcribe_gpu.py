@@ -68,6 +68,14 @@ PRE_SPEECH_PADDING_MS = 250
 STREAM_RESTART_S = 36 * 3600
 STREAM_HEALTH_CHECK_S = 30
 
+# Liveness for monitoring. The heartbeat is a kv row rather than an event, so
+# it does not add ~2,900 rows a day to the log; admin_ui.py's /healthz reads it.
+HEARTBEAT_INTERVAL_S = 30
+# How long a stream may go without a transcript before /healthz calls it
+# silent, unless its config sets `silence_alert_minutes`. Radio is quiet at
+# night, so this has to clear the longest normal lull, not the typical one.
+DEFAULT_SILENCE_ALERT_MIN = 240
+
 # Read timeout - how long to wait for data before considering stream stalled
 READ_TIMEOUT_S = 5.0
 MAX_CONSECUTIVE_TIMEOUTS = 10  # After this many timeouts, restart stream
@@ -721,6 +729,8 @@ def load_config(config_path):
                 "tone_lookup_path": s.get("tone_lookup"),
                 "group": group_name,
                 "color": STREAM_COLORS[color_idx % len(STREAM_COLORS)],
+                "silence_alert_minutes": s.get("silence_alert_minutes",
+                                               DEFAULT_SILENCE_ALERT_MIN),
             }
             streams.append(entry)
             all_streams.append(entry)
@@ -1527,6 +1537,37 @@ def main():
     started_mono = time.monotonic()
     record_lifecycle(events.process_started())
 
+    # Heartbeat. `loop_at` is when the main loop last came round, which it does
+    # at least once a second while idle; this thread beating on while it stays
+    # put is a hung transcription loop, not a healthy scanner.
+    started_at = events.utc_now()
+    loop_at = [time.time()]
+    heartbeat_streams = [
+        {"name": s["name"], "group": s["group"],
+         "silence_alert_s": int(s.get("silence_alert_minutes",
+                                      DEFAULT_SILENCE_ALERT_MIN) * 60)}
+        for s in all_streams
+    ]
+
+    def heartbeat():
+        while not stop_event.is_set():
+            try:
+                store.kv.set("health", "heartbeat", {
+                    "pid": os.getpid(),
+                    "started_at": started_at,
+                    "interval_s": HEARTBEAT_INTERVAL_S,
+                    "loop_at": loop_at[0],
+                    "queue_depth": work_queue.qsize(),
+                    "streams": heartbeat_streams,
+                })
+            except Exception as e:
+                print(f"[{format_timestamp()}] [warn] heartbeat failed "
+                      f"({type(e).__name__}: {e})")
+            stop_event.wait(HEARTBEAT_INTERVAL_S)
+
+    if store is not None:
+        threading.Thread(target=heartbeat, daemon=True).start()
+
     # Shutdown
     shutting_down = threading.Event()
 
@@ -1666,6 +1707,7 @@ def main():
 
     try:
         while not stop_event.is_set():
+            loop_at[0] = time.time()
             try:
                 stream_name, chunk_data = work_queue.get(timeout=1)
             except queue.Empty:
