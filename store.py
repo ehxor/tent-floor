@@ -813,13 +813,17 @@ class Store:
 # Kept as strings rather than importing events.py: this module is the bottom
 # of the stack and nothing else here needs that dependency.
 HEALTH_TYPES = ("poller.error", "poller.recovered",
-                "stream.error", "stream.recovered")
+                "stream.error", "stream.recovered",
+                "process.started", "process.exited")
 _FAILING_TYPES = ("poller.error", "stream.error")
+_HEALTH_STATES = {"process.started": "running", "process.exited": "STOPPED"}
 
 
 def _health_subject(event):
     """(label, sort key) naming what a health event is about."""
     data = event.get("data", {})
+    if event["type"].startswith("process."):
+        return "scanner process", ("process", "", "")
     if event["type"].startswith("stream."):
         stream, component = event.get("stream"), data.get("component")
         return f"{stream} {component}", ("stream", stream or "", component or "")
@@ -855,8 +859,7 @@ def print_health(store, limit=20, history=False):
                 label += f" [{event['group']}]"
             print(f"  {event['ts']}  {label}")
             print(f"      {event['render']['plain']}")
-            for line in event.get("data", {}).get("stderr") or ():
-                print(f"        | {line}")
+            _print_evidence(event)
         return
 
     latest = {}
@@ -867,11 +870,21 @@ def print_health(store, limit=20, history=False):
     for _key, (label, event) in sorted(latest.items()):
         if event.get("group"):
             label += f" [{event['group']}]"
-        state = "FAILING" if event["type"] in _FAILING_TYPES else "ok"
+        state = _HEALTH_STATES.get(
+            event["type"], "FAILING" if event["type"] in _FAILING_TYPES else "ok")
         print(f"  {label:36} {state}")
         print(f"      {event['ts']}  {event['render']['plain']}")
-        for line in event.get("data", {}).get("stderr") or ():
-            print(f"        | {line}")
+        _print_evidence(event)
+
+
+def _print_evidence(event):
+    """ffmpeg's last stderr lines, or the traceback a fatal exit left."""
+    data = event.get("data", {})
+    for line in data.get("stderr") or ():
+        print(f"        | {line}")
+    for line in data.get("traceback") or ():
+        for part in line.rstrip("\n").splitlines():
+            print(f"        | {part}")
 
 
 def main():

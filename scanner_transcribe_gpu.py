@@ -34,6 +34,7 @@ import re
 import threading
 import queue
 import tempfile
+import traceback
 import struct
 import os
 import select
@@ -274,7 +275,13 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
                "--language", "en", "--beam-size", str(beam_size), "--no-timestamps"]
         if prompt:
             cmd.extend(["--prompt", prompt])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        # Not text=True: that decodes strictly, and whisper.cpp prints tokens
+        # byte by byte, so a multi-byte character split across two tokens is
+        # invalid UTF-8. A UnicodeDecodeError escaping here would stop the whole
+        # scanner over one transmission — the likeliest cause of an outage
+        # that left a whisper run with neither a transcript nor an error.
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8",
+                                errors="replace", timeout=60)
         if result.returncode != 0:
             print(f"[debug] whisper failed (code {result.returncode}): {result.stderr.strip()}")
             if on_error is not None:
@@ -294,6 +301,8 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
             text = re.sub(r'\*[^*]+\*', '', text).strip()
             text = re.sub(r'\[[^\]]*\]', '', text).strip()
             text = re.sub(r'\([^)]*\)', '', text).strip()
+            # What is left of a split character is noise, not text.
+            text = text.replace("�", "").strip()
             if text and text not in HALLUCINATIONS:
                 lines.append(text)
         return " ".join(lines)
@@ -301,6 +310,13 @@ def transcribe_chunk(whisper_bin, model_path, wav_bytes, prompt=None, beam_size=
         print(f"[debug] whisper timeout (>60s)")
         if on_error is not None:
             on_error("whisper_timeout", "whisper did not finish within 60s")
+        return None
+    except Exception as e:
+        # A spawn failure (fd or process limits) or anything else unforeseen
+        # is a failed transcription, not a reason to stop transcribing.
+        print(f"[debug] whisper failed ({type(e).__name__}: {e})")
+        if on_error is not None:
+            on_error("whisper_failed", f"{type(e).__name__}: {e}")
         return None
     finally:
         os.unlink(tmp.name)
@@ -1499,9 +1515,37 @@ def main():
     # Transcription lock
     transcribe_lock = threading.Lock()
 
+    def record_lifecycle(event):
+        if store is None:
+            return
+        try:
+            store.events.append(event)
+        except Exception as e:
+            print(f"[warn] could not record {event['type']} "
+                  f"({type(e).__name__}: {e})")
+
+    started_mono = time.monotonic()
+    record_lifecycle(events.process_started())
+
     # Shutdown
-    def shutdown(sig=None, frame=None):
+    shutting_down = threading.Event()
+
+    def shutdown(sig=None, frame=None, reason=None, detail=None, exit_code=0,
+                 tb=None):
+        # The signal handler's sys.exit unwinds through the main loop's
+        # `finally`, which calls this again; the first call already did it all.
+        if shutting_down.is_set():
+            return
+        shutting_down.set()
+        if sig is not None:
+            reason, detail = "signal", signal.Signals(sig).name
+        elif reason is None:
+            reason = "main_loop_ended"
         print("\n[exit] Shutting down...")
+        # Recorded first, so a step below that hangs cannot take it with it.
+        record_lifecycle(events.process_exited(
+            reason, detail=detail, exit_code=exit_code, traceback=tb,
+            uptime_s=time.monotonic() - started_mono))
         # Let in-flight deliveries finish before the stop flag cuts them off.
         # Whatever does not make it keeps its cursor unadvanced and goes out on
         # the next start, so this is a courtesy, not correctness.
@@ -1521,7 +1565,7 @@ def main():
         with managed_lock:
             for ms in managed_streams:
                 kill_ffmpeg(ms["proc"])
-        sys.exit(0)
+        sys.exit(exit_code)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -1543,6 +1587,83 @@ def main():
     threading.Thread(target=silence_monitor, daemon=True).start()
 
     # --- Main processing loop ---
+    def handle_chunk(stream_name, chunk_data):
+        """Tone detection, transcription and output for one transmission."""
+        # Look up this stream's group and outputs
+        group_name = stream_group_map.get(stream_name, "default")
+        group = groups.get(group_name)
+        if not group:
+            return
+        out = group["outputs"]
+
+        audio_np = np.frombuffer(chunk_data, dtype=np.int16).astype(np.float32) / 32768.0
+        duration = len(audio_np) / SAMPLE_RATE
+
+        color = stream_color_map.get(stream_name, "")
+        reset = COLOR_RESET if not args.no_color else ""
+        bold = COLOR_BOLD if not args.no_color else ""
+
+        # Tone detection
+        det = stream_tone_detectors.get(stream_name)
+        if det:
+            tone_events = det.feed_audio(audio_np, SAMPLE_RATE)
+            for event in tone_events:
+                unit = event["unit"] or "UNKNOWN (logged)"
+                print(f"[{format_timestamp()}] {bold}{color}{stream_name}{reset} "
+                      f"*** PAGE: {event['key']} → {unit} ***")
+                out.emit(events.tone_page(group_name, stream_name, event))
+
+        # Transcribe. The clip is written first so a whisper timeout or
+        # crash cannot take the audio with it; if nothing transcribable
+        # comes back it is deleted again below.
+        clip = None
+        if clip_store is not None:
+            clip = clip_store.write(chunk_data, group_name, stream_name,
+                                    duration_s=duration)
+
+        prompt = stream_jargon.get(stream_name)
+        whisper_error = []
+        with transcribe_lock:
+            t0 = time.monotonic()
+            wav_bytes = pcm_to_wav_bytes(audio_np)
+            text = transcribe_chunk(whisper_bin, model_path, wav_bytes,
+                                     prompt=prompt, beam_size=BEAM_SIZE,
+                                     on_error=lambda k, d: whisper_error.append((k, d)))
+            elapsed = time.monotonic() - t0
+
+        transcribe_health = stream_health.get(stream_name, {}).get("transcribe")
+        if transcribe_health is not None:
+            if text is None:
+                kind, detail = (whisper_error[0] if whisper_error
+                                else ("whisper_failed", "transcription failed"))
+                transcribe_health.failed(kind, detail, context={
+                    "audio_s": round(duration, 2),
+                    "clip": clip["id"] if clip else None,
+                })
+            else:
+                transcribe_health.ok()
+
+        if text:
+            print(f"[{format_timestamp()}] {color}{stream_name}{reset} "
+                  f"({duration:.1f}s audio, {elapsed:.1f}s) {text}")
+            out.emit(events.transcript(group_name, stream_name, text,
+                                      duration_s=duration,
+                                      model=model_name,
+                                      latency_s=elapsed,
+                                      audio=events.audio_ref(clip) if clip else None))
+        elif text is None and clip is not None:
+            # whisper crashed or timed out. This is precisely the audio
+            # worth keeping, so the clip stays and ages out normally — no
+            # event references it, but it is on disk for the retention
+            # window if someone wants to hear what the GPU choked on.
+            print(f"[{format_timestamp()}] {color}{stream_name}{reset} "
+                  f"transcription failed; kept clip {clip['id'][:12]}")
+        elif should_delete_clip(text, clip):
+            # Silence, or a phrase the hallucination filter rejected. No
+            # event will ever reference this clip, so it is not worth a week
+            # of disk.
+            clip_store.delete(clip["id"])
+
     try:
         while not stop_event.is_set():
             try:
@@ -1556,83 +1677,25 @@ def main():
 
             last_activity[stream_name] = time.monotonic()
 
-            # Look up this stream's group and outputs
-            group_name = stream_group_map.get(stream_name, "default")
-            group = groups.get(group_name)
-            if not group:
-                continue
-            out = group["outputs"]
-
-            audio_np = np.frombuffer(chunk_data, dtype=np.int16).astype(np.float32) / 32768.0
-            duration = len(audio_np) / SAMPLE_RATE
-
-            color = stream_color_map.get(stream_name, "")
-            reset = COLOR_RESET if not args.no_color else ""
-            bold = COLOR_BOLD if not args.no_color else ""
-
-            # Tone detection
-            det = stream_tone_detectors.get(stream_name)
-            if det:
-                tone_events = det.feed_audio(audio_np, SAMPLE_RATE)
-                for event in tone_events:
-                    unit = event["unit"] or "UNKNOWN (logged)"
-                    print(f"[{format_timestamp()}] {bold}{color}{stream_name}{reset} "
-                          f"*** PAGE: {event['key']} → {unit} ***")
-                    out.emit(events.tone_page(group_name, stream_name, event))
-
-            # Transcribe. The clip is written first so a whisper timeout or
-            # crash cannot take the audio with it; if nothing transcribable
-            # comes back it is deleted again below.
-            clip = None
-            if clip_store is not None:
-                clip = clip_store.write(chunk_data, group_name, stream_name,
-                                        duration_s=duration)
-
-            prompt = stream_jargon.get(stream_name)
-            whisper_error = []
-            with transcribe_lock:
-                t0 = time.monotonic()
-                wav_bytes = pcm_to_wav_bytes(audio_np)
-                text = transcribe_chunk(whisper_bin, model_path, wav_bytes,
-                                         prompt=prompt, beam_size=BEAM_SIZE,
-                                         on_error=lambda k, d: whisper_error.append((k, d)))
-                elapsed = time.monotonic() - t0
-
-            transcribe_health = stream_health.get(stream_name, {}).get("transcribe")
-            if transcribe_health is not None:
-                if text is None:
-                    kind, detail = (whisper_error[0] if whisper_error
-                                    else ("whisper_failed", "transcription failed"))
-                    transcribe_health.failed(kind, detail, context={
-                        "audio_s": round(duration, 2),
-                        "clip": clip["id"] if clip else None,
-                    })
-                else:
-                    transcribe_health.ok()
-
-            if text:
-                print(f"[{format_timestamp()}] {color}{stream_name}{reset} "
-                      f"({duration:.1f}s audio, {elapsed:.1f}s) {text}")
-                out.emit(events.transcript(group_name, stream_name, text,
-                                          duration_s=duration,
-                                          model=model_name,
-                                          latency_s=elapsed,
-                                          audio=events.audio_ref(clip) if clip else None))
-            elif text is None and clip is not None:
-                # whisper crashed or timed out. This is precisely the audio
-                # worth keeping, so the clip stays and ages out normally — no
-                # event references it, but it is on disk for the retention
-                # window if someone wants to hear what the GPU choked on.
-                print(f"[{format_timestamp()}] {color}{stream_name}{reset} "
-                      f"transcription failed; kept clip {clip['id'][:12]}")
-            elif should_delete_clip(text, clip):
-                # Silence, or a phrase the hallucination filter rejected. No
-                # event will ever reference this clip, so it is not worth a week
-                # of disk.
-                clip_store.delete(clip["id"])
+            # One transmission that cannot be processed costs that
+            # transmission, not every feed and poller in the process.
+            try:
+                handle_chunk(stream_name, chunk_data)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[{format_timestamp()}] [{stream_name}] [error] chunk failed: "
+                      f"{type(e).__name__}: {e}\n{tb}", end="")
+                transcribe_health = stream_health.get(stream_name, {}).get("transcribe")
+                if transcribe_health is not None:
+                    transcribe_health.failed(
+                        "chunk_error", f"{type(e).__name__}: {e}",
+                        context={"traceback": tb.splitlines()[-12:]})
 
     except Exception as e:
-        print(f"[error] {e}")
+        tb = traceback.format_exc()
+        print(f"[error] main loop died: {type(e).__name__}: {e}\n{tb}", end="")
+        shutdown(reason="fatal_error", detail=f"{type(e).__name__}: {e}",
+                 exit_code=1, tb=tb.splitlines()[-20:])
     finally:
         shutdown()
 

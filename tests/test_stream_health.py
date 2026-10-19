@@ -11,6 +11,7 @@ import io
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -270,6 +271,29 @@ class WhisperErrorTests(unittest.TestCase):
         self.assertEqual(text, "engine three")
         self.assertEqual(errors, [])
 
+    def test_unexpected_exception_is_a_failed_transcription(self):
+        text, errors = self._transcribe(
+            raises=BlockingIOError(35, "Resource temporarily unavailable"))
+        self.assertIsNone(text)
+        self.assertEqual(errors[0][0], "whisper_failed")
+        self.assertIn("BlockingIOError", errors[0][1])
+
+    def test_split_utf8_character_does_not_raise(self):
+        # whisper.cpp prints tokens byte by byte, so half of a multi-byte
+        # character reaches stdout on its own. Strict decoding raised out of
+        # transcribe_chunk and the main loop's handler stopped the scanner.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "whisper-cli"
+            fake.write_text("#!/bin/sh\nprintf ' Engine \\342\\200 three\\n'\n")
+            fake.chmod(0o755)
+            errors = []
+            with mock.patch.object(sys, "stdout", io.StringIO()):
+                text = stg.transcribe_chunk(
+                    str(fake), "model.bin", b"RIFF",
+                    on_error=lambda k, d: errors.append((k, d)))
+        self.assertEqual(text, "Engine  three")
+        self.assertEqual(errors, [])
+
 
 # ---------------------------------------------------------------------------
 # store.py --health
@@ -310,6 +334,29 @@ class HealthReadoutTests(unittest.TestCase):
         text = self._print()
         self.assertRegex(text, r"A audio\s+ok")
         self.assertRegex(text, r"A transcribe\s+FAILING")
+
+    def test_a_fatal_exit_shows_stopped_with_its_traceback(self):
+        self.store.events.append(events.process_started(pid=42))
+        self.store.events.append(events.process_exited(
+            "fatal_error", detail="UnicodeDecodeError: invalid start byte",
+            exit_code=1, uptime_s=90061, pid=42,
+            traceback=["Traceback (most recent call last):",
+                       '  File "scanner_transcribe_gpu.py", line 1, in main',
+                       "UnicodeDecodeError: invalid start byte"]))
+        self.assertIn(events.PROCESS_EXITED, HEALTH_TYPES)
+        self.assertIn(events.PROCESS_EXITED, outputs.SUPPRESSED_TYPES)
+
+        text = self._print()
+        self.assertRegex(text, r"scanner process\s+STOPPED")
+        self.assertIn("fatal_error: UnicodeDecodeError", text)
+        self.assertIn("code 1, up 1d01h", text)
+        self.assertIn("| UnicodeDecodeError: invalid start byte", text)
+
+    def test_a_restart_shows_running(self):
+        self.store.events.append(events.process_exited("signal", detail="SIGTERM"))
+        self.store.events.append(events.process_started())
+
+        self.assertRegex(self._print(), r"scanner process\s+running")
 
     def test_history_lists_every_event(self):
         audio = events.StreamHealth("A", "audio", emit=self.store.events.append)

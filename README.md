@@ -280,7 +280,7 @@ policy, one run per stage, named by `data.component`:
 |--------------|----------------------------------------------------------------|---------------------------------------------------------------------------------------------|
 | `audio`      | ffmpeg and the reader — every watchdog restart and why          | `ffmpeg_exit`, `stalled`, `eof`, `startup_failed`, `stale`, `read_error`, `thread_error`, `watchdog_error` |
 | `queue`      | handing a transmission to whisper                              | `queue_full` (the GPU is falling behind and audio is being dropped)                          |
-| `transcribe` | whisper itself                                                 | `whisper_exit`, `whisper_timeout`                                                           |
+| `transcribe` | whisper, and anything else that failed one transmission        | `whisper_exit`, `whisper_timeout`, `whisper_failed`, `chunk_error` (with `data.traceback`)  |
 
 `audio` errors carry the last lines ffmpeg wrote (`data.stderr`), its exit code,
 how long it had been up and how long since it last produced audio. `--health`
@@ -291,6 +291,18 @@ sqlite3 tentfloor.db \
   "SELECT ts, stream, json_extract(body,'$.data.component'), json_extract(body,'$.data.detail')
      FROM events WHERE type LIKE 'stream.%' ORDER BY seq DESC LIMIT 20"
 ```
+
+### Process health
+
+The scanner records `process.started` when it comes up and `process.exited`
+when it goes down, with `data.reason` (`signal`, `fatal_error`,
+`main_loop_ended`), the exit code, uptime and — for a fatal error — the
+traceback. `--health` shows the latest as `scanner process  running` or
+`STOPPED`. An exception while processing one transmission no longer stops the
+process: it is recorded as a `transcribe` `chunk_error` and the loop carries on.
+A process that is killed outright (`kill -9`, power loss) records nothing, so a
+`process.started` that follows another with no `process.exited` between them
+means exactly that.
 
 Pass `--no-store` (or set `store.enabled` to `false`) to run without it. Change detection then falls back to memory and restarts re-announce everything — the pre-store behaviour.
 

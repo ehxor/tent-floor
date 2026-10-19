@@ -76,7 +76,9 @@ SUPPRESSED_TYPES = frozenset({events.WILDFIRE_REMOVED,
                               events.POLLER_ERROR,
                               events.POLLER_RECOVERED,
                               events.STREAM_ERROR,
-                              events.STREAM_RECOVERED})
+                              events.STREAM_RECOVERED,
+                              events.PROCESS_STARTED,
+                              events.PROCESS_EXITED})
 
 
 class PermanentFailure(Exception):

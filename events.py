@@ -78,6 +78,14 @@ STREAM_RECOVERED = "stream.recovered"
 # transcribe: whisper itself.
 STREAM_COMPONENTS = ("audio", "queue", "transcribe")
 
+# The scanner process itself. An exception in the transcription loop used to
+# print one line to a terminal and stop every feed and poller at once; the
+# health log showed the last recoveries from before it died and nothing about
+# the death. `process.started` is what tells "stopped" from "stopped and came
+# back", so `store.py --health` can say which state it is in now.
+PROCESS_STARTED = "process.started"
+PROCESS_EXITED = "process.exited"
+
 # ---------------------------------------------------------------------------
 # Tiers
 #
@@ -497,3 +505,41 @@ class StreamHealth(Health):
         super().__init__({"component": component}, f"{stream} {component}",
                          group=group, stream=stream, emit=emit,
                          rewarn_s=rewarn_s, clock=clock)
+
+
+# ---------------------------------------------------------------------------
+# Process lifecycle
+# ---------------------------------------------------------------------------
+def process_started(pid=None):
+    pid = os.getpid() if pid is None else pid
+    return envelope(
+        PROCESS_STARTED, {"pid": pid}, None, tier=TIER_SENSITIVE,
+        render_plain=f"▶️  scanner started (pid {pid})",
+        render_discord=f"▶️  scanner started (pid {pid})")
+
+
+def process_exited(reason, detail=None, exit_code=0, traceback=None,
+                   uptime_s=None, pid=None):
+    """`reason` is what ended it: "signal", "fatal_error" or "main_loop_ended".
+    `traceback` is the formatted lines of a fatal exception — the one piece of
+    evidence that used to exist only in the terminal that printed it."""
+    pid = os.getpid() if pid is None else pid
+    data = {
+        "pid": pid,
+        "reason": reason,
+        "detail": detail,
+        "exit_code": exit_code,
+    }
+    if uptime_s is not None:
+        data["uptime_s"] = round(uptime_s, 3)
+    if traceback:
+        data["traceback"] = list(traceback)
+    plain = f"⏹️  scanner exited ({reason}"
+    if detail:
+        plain += f": {detail}"
+    plain += f", code {exit_code}"
+    if uptime_s is not None:
+        plain += f", up {_duration(uptime_s)}"
+    plain += ")"
+    return envelope(PROCESS_EXITED, data, None, tier=TIER_SENSITIVE,
+                    render_plain=plain, render_discord=plain)
