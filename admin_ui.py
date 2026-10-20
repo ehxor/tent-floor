@@ -171,6 +171,19 @@ class Library:
             self._local.conn = conn
         return conn
 
+    def release(self):
+        """Close this thread's connection.
+
+        Every request arrives on a new thread, and a connection left to its
+        thread-local was never closed: each held two descriptors (the database
+        and its WAL), so a monitor polling once a minute exhausted macOS's
+        256-descriptor default in about two hours, after which every route
+        failed with "unable to open database file"."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            self._local.conn = None
+            conn.close()
+
     # -- search -------------------------------------------------------------
     def search(self, query="", stream=None, group=None, since=None, until=None,
                limit=DEFAULT_LIMIT, offset=0):
@@ -337,6 +350,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_error(self, status, message):
         self._send_json({"error": message}, status=status)
+
+    def handle(self):
+        # One thread per client connection, so its sqlite connection goes when
+        # the client does — after every keep-alive request on it is served.
+        try:
+            super().handle()
+        finally:
+            if self.library is not None:
+                self.library.release()
 
     # -- routes -------------------------------------------------------------
     def do_GET(self):

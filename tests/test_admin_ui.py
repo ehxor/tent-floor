@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -428,6 +429,41 @@ class Healthz(ServerFixture, unittest.TestCase):
         status, _, body = self.get("/healthz")
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["status"], "ok")
+
+
+class ConnectionLifetime(ServerFixture, unittest.TestCase):
+
+    def test_each_requests_connection_is_closed(self):
+        """Every request is a new thread with its own sqlite connection. Left
+        open, a monitor polling /healthz once a minute ran the process out of
+        file descriptors in about two hours."""
+        opened = []
+
+        class Tracked(sqlite3.Connection):
+            closed = False
+
+            def close(self):
+                self.closed = True
+                super().close()
+
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, factory=Tracked, **kwargs)
+            opened.append(conn)
+            return conn
+
+        with mock.patch.object(admin_ui.sqlite3, "connect", connect):
+            for _ in range(5):
+                self.get("/healthz")
+                self.get("/api/stats")
+            # The handler thread closes its connection after the response
+            # is sent, so give the last one a moment to finish.
+            deadline = time.time() + 5
+            while not all(c.closed for c in opened) and time.time() < deadline:
+                time.sleep(0.01)
+        self.assertGreaterEqual(len(opened), 5)
+        self.assertEqual([c for c in opened if not c.closed], [])
 
 
 class TokenAuth(unittest.TestCase):
