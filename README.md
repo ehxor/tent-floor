@@ -219,6 +219,17 @@ This is an admin tool, not part of the public feed:
 
 Playback needs a browser that handles Ogg Opus — Firefox and Chrome have for years; Safari only in recent versions. If a clip downloads instead of playing, that is the likely cause.
 
+## Evaluating Whistle
+
+`tools/eval_whistle.py` re-transcribes the most recent clips with [Whistle](https://github.com/cactus-compute/needle#whistle), a 16.9 MB CPU-only speech-to-text model, and scores each result against the whisper transcript stored beside it (issue #15). It opens the store read-only and writes nothing but the report files you ask for.
+
+```bash
+pip install cactus-needle            # Whistle; weights download on first use
+python tools/eval_whistle.py --db tentfloor.db --clips clips -n 100 --jargon jargon.txt --csv whistle.csv
+```
+
+The score is **word error rate**: word-level edit distance (substitutions + deletions + insertions) divided by the whisper word count. Character error rate is reported too, so a near miss ("Lanceville" for "Lantzville") reads differently from garbage. Both sides are normalised first (the Whisper normaliser if `whisper-normalizer` is installed, otherwise a built-in one), so "Engine 3," and "engine three" count as the same. whisper is the reference, not the truth, so read the number as disagreement and listen to the worst rows before blaming either model.
+
 ## State Store
 
 Every poller detects change by comparing the current poll against what it saw last time. That comparison state lives in a single sqlite file (`store.path`), shared by all of them.
